@@ -1,0 +1,14 @@
+black
+boto3
+h5netcdf
+netCDF4
+numpy
+pandas
+scipy
+scikit-image
+trackpy
+xarray
+pytest
+earthengine-api
+cfgrib
+eccodes
