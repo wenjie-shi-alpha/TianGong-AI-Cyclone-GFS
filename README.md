@@ -1,6 +1,84 @@
 
 # TianGong AI Cyclone
 
+## GFS 全流程优化说明（2026-02）
+
+本项目当前针对 GFS 下载→解析→追踪→环境提取做了如下优化：
+
+1. **台风驱动的 cycle 选择**
+  - 使用 `input/matched_cyclone_tracks.csv` 自动计算所需 `00Z/12Z` cycles。
+  - 每个台风按 `start-lead_days ~ end` 反推 cycle，避免盲目全量下载。
+  - 入口脚本：`src/assemble_and_run_grib.py`。
+
+2. **两阶段批处理流水线**
+  - 阶段 A：并行下载 GRIB + 并行 cfgrib 解析并组装 NC。
+  - 阶段 B：批次级调用 `process_nc_files` 做追踪与环境提取。
+  - 支持按批次输出进度、ETA、成功/跳过统计。
+
+3. **高性能缓存与空间控制**
+  - 优先使用 `/dev/shm/grib_cache`（RAM tmpfs）加速 I/O；空间不足时回落到 `data/grib_cache`。
+  - 写出 NC 后自动清理 GRIB 子目录，降低缓存峰值占用。
+  - 仅当缓存目录位于 `/dev/shm` 时，才启用 `/dev/shm` 占用阈值等待逻辑（避免磁盘缓存场景被误限流）。
+
+4. **NC 复用与质量校验**
+  - 对已存在 NC 文件做尺寸与关键变量完整性检查（`msl/10u/10v/z`）。
+  - 完整 NC 直接复用，损坏或不完整 NC 自动重建。
+
+5. **追踪初始化逻辑修复（关键）**
+  - 从“只按 `f000` 附近匹配初始点”改为“按整个 forecast window 匹配初始点”。
+  - 对每个 storm 在窗口内选择初始点，并从最接近该初始点的预报时次开始追踪。
+  - 修复了“下载了 cycle 但误判无轨迹而跳过”的漏算问题。
+
+6. **并行与稳定性增强**
+  - `cycle-workers / download-threads / parse-workers / processes` 可独立调优。
+  - 多进程提取支持 `final_single_output/logs/` 明细日志（非 concise 模式）。
+
+### 推荐执行命令
+
+1) **全量生产运行（自动 cycle 计算）**
+
+```bash
+PYTHONPATH=src python -u src/assemble_and_run_grib.py \
+  --tracks input/matched_cyclone_tracks.csv \
+  --cycle-workers 6 \
+  --download-threads 12 \
+  --parse-workers 20 \
+  --processes 12
+```
+
+2) **后台运行并写日志**
+
+```bash
+PYTHONPATH=src nohup python -u src/assemble_and_run_grib.py \
+  --tracks input/matched_cyclone_tracks.csv \
+  --cycle-workers 6 \
+  --download-threads 12 \
+  --parse-workers 20 \
+  --processes 12 > run_fullscale.log 2>&1 &
+```
+
+3) **小样本冒烟测试（手动指定 cycles）**
+
+```bash
+PYTHONPATH=src python -u src/assemble_and_run_grib.py \
+  --tracks input/matched_cyclone_tracks.csv \
+  --cycles 20260219T00 20260219T12 20260220T00 20260220T12 \
+  --processes 10
+```
+
+4) **停止运行中的任务**
+
+```bash
+ps -eo pid,cmd | grep 'python.*src/assemble_and_run_grib.py' | grep -v grep | awk '{print $1}' | xargs -r kill
+```
+
+5) **归档结果目录**
+
+```bash
+tar -czf final_single_output_$(date +%Y%m%d_%H%M%S).tar.gz final_single_output
+tar -czf track_single_$(date +%Y%m%d_%H%M%S).tar.gz track_single
+```
+
 ## src 目录模块说明
 
 - `environment_extractor/`：一体化的热带气旋环境分析流水线，涵盖命令行入口、下载与追踪编排（`cli.py`、`pipeline.py`）、形状分析工具（`shape_analysis.py`）以及对外部依赖的封装（`deps.py`、`workflow_utils.py`）。

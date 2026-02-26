@@ -550,6 +550,11 @@ def process_nc_files(
 
     keep_nc_flag = bool(getattr(args, "no_clean", False) or getattr(args, "keep_nc", False))
 
+    logs_dir: Path | None = None
+    if logs_root is not None and parallel and not concise_log:
+        logs_dir = logs_root
+        logs_dir.mkdir(parents=True, exist_ok=True)
+
     def remove_nc_file(path: Path, reason: str) -> None:
         if keep_nc_flag:
             return
@@ -645,12 +650,6 @@ def process_nc_files(
                     track_file = exact_candidates[0]
                 elif tag_candidates:
                     track_file = tag_candidates[0]
-                else:
-                    leftover = sorted(tdir.glob("tracks_*.csv"))
-                    if leftover:
-                        summary(
-                            "⚠️ 找到现有轨迹文件但与当前 NC 不匹配，已忽略并重新追踪"
-                        )
         if track_file is None:
             if args.auto:
                 from initialTracker import track_file_with_initials as it_track_file_with_initials

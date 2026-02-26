@@ -16,7 +16,7 @@ from shared.grib_loader import is_griblist, load_paths_from_griblist, open_grib_
 from .batching import _Metadata, _SimpleBatch
 from .dataset_adapter import _DsAdapter
 from .exceptions import NoEyeException
-from .initials import _select_initials_for_time
+from .initials import _select_initials_for_window
 from .tracker import Tracker
 from .robust_tracker import RobustTracker
 
@@ -89,11 +89,19 @@ def track_file_with_initials(
         raise ValueError(f"文件无时间维度: {nc_path}")
 
     t0 = pd.Timestamp(times[0])
-    initials = _select_initials_for_time(all_points, t0, tol_hours=time_window_hours)
+    t_end = pd.Timestamp(times[-1])
+    initials = _select_initials_for_window(
+        all_points,
+        t0,
+        t_end,
+        tol_hours=time_window_hours,
+    )
     if initials.empty:
         logger.info(
-            "%s: 在 ±%s 小时内未匹配到任何气旋初始点, 跳过",
+            "%s: 在预报窗口 [%s, %s] (±%s小时缓冲) 未匹配到任何气旋初始点, 跳过",
             nc_path.name,
+            t0,
+            t_end,
             time_window_hours,
         )
         ds.close()
@@ -130,15 +138,18 @@ def track_file_with_initials(
         if init_msl is not None:
             init_msl *= 100.0  # catalogue provides hPa, tracker persists Pascals
 
+        init_time = pd.Timestamp(row["init_time"]) if "init_time" in row else t0
+        start_idx = int(np.argmin(np.abs(pd.to_datetime(times) - init_time)))
+
         tracker = tracker_cls(
             init_lat=init_lat,
             init_lon=init_lon,
-            init_time=times[0],
+            init_time=times[start_idx],
             init_msl=init_msl,
             init_wind=init_wind,
         )
 
-        for time_idx in range(len(times)):
+        for time_idx in range(start_idx, len(times)):
             cache = time_cache.get(time_idx)
             if cache is None:
                 msl_2d = adapter.msl_at(time_idx)
@@ -170,7 +181,7 @@ def track_file_with_initials(
             try:
                 tracker.step(batch)
             except NoEyeException as exc:
-                if time_idx == 0:
+                if time_idx == start_idx:
                     logger.info("%s: 首步失败, 跳过 (%s)", storm_id, exc)
                     tracker = None  # type: ignore[assignment]
                     break

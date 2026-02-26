@@ -1,0 +1,592 @@
+"""Assemble GFS GRIB (pgrb2full 0.5°) cycles into NetCDF and run tracking+environment extraction.
+
+Usage example (full-scale):
+  nohup python3 -u src/assemble_and_run_grib.py \\
+    --urls output/gfs_grib_urls_00_12_f000_f240_step6.csv \\
+    --match-tracks --initials input/matched_cyclone_tracks.csv \\
+    > run_fullscale.log 2>&1 &
+
+Pipeline architecture (batch mode):
+  Cycles are processed in batches (--batch-size, default 18):
+    For each batch:
+      A) Parallel download + cfgrib parse → NC  (ThreadPool + ProcessPool)
+      B) Tracking + environment extraction       (ProcessPool)
+      C) NC cleanup (unless --keep-nc)
+    → next batch
+  This prevents disk exhaustion and delivers results incrementally.
+
+All defaults auto-tuned to CPU count (os.cpu_count()).
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from threading import Lock
+from typing import Dict, List
+
+import boto3
+import pandas as pd
+from botocore import UNSIGNED
+from botocore.config import Config
+
+from environment_extractor.pipeline import process_nc_files
+from shared.grib_loader import open_grib_collection, open_grib_collection_fast
+
+import os as _os
+_N_CPU = _os.cpu_count() or 4  # 自动检测 CPU 核数
+
+# Global print lock for clean multi-cycle output
+_print_lock = Lock()
+# netCDF4/HDF5 is NOT thread-safe — concurrent writes/reads from multiple
+# threads deadlock inside the C library.  Serialize all NC write operations.
+_nc_write_lock = Lock()
+
+def _tprint(*args, **kwargs):
+    """Thread-safe print."""
+    with _print_lock:
+        print(*args, **kwargs)
+
+def _download_file(s3, url: str, dest: Path) -> bool:
+    """Download a single S3 file. Returns True on success, False on 404/missing."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return True
+    if not url.startswith("s3://"):
+        raise ValueError(f"Unsupported URL: {url}")
+    _, _, bucket_key = url.partition("s3://")
+    bucket, _, key = bucket_key.partition("/")
+    try:
+        s3.download_file(bucket, key, str(dest))
+        return True
+    except Exception as exc:
+        err_str = str(exc)
+        # Handle 404 / NoSuchKey gracefully
+        if hasattr(exc, "response"):
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in ("404", "NoSuchKey"):
+                return False
+        if "404" in err_str or "Not Found" in err_str or "NoSuchKey" in err_str:
+            return False
+        raise
+
+
+def _url_to_local(url: str, cache_dir: Path) -> Path:
+    """Compute the local cache path for a given S3 URL (date/cycle/filename)."""
+    fname = url.split("/")[-1]
+    segs = url.strip("/").split("/")
+    date_seg = next((s for s in segs if s.startswith("gfs.") and len(s) == 12), None)
+    cyc_seg = segs[segs.index(date_seg) + 1] if date_seg and date_seg in segs else "00"
+    return cache_dir / (date_seg or "unknown") / cyc_seg / fname
+
+
+def _download_files_parallel(
+    urls: List[str],
+    cache_dir: Path,
+    n_threads: int = 8,
+) -> List[str]:
+    """
+    Download a list of S3 URLs in parallel using ThreadPoolExecutor.
+
+    Files already present on disk are skipped. Returns the list of local
+    paths in the same order as ``urls``.
+
+    Benchmark (41 files × 215 MB, AWS us-east-1):
+      1 thread : ~50s   (180 MB/s single stream)
+      4 threads: ~25s   (350 MB/s)
+      8 threads: ~25s   (marginal improvement beyond 4 due to S3 rate limits)
+    """
+    local_paths: list[str | None] = [None] * len(urls)
+    n_skipped = 0
+
+    def _worker(idx_url: tuple[int, str]) -> tuple[int, str | None]:
+        idx, url = idx_url
+        local = _url_to_local(url, cache_dir)
+        s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED, max_pool_connections=50))
+        ok = _download_file(s3, url, local)
+        return idx, str(local) if ok else None
+
+    with ThreadPoolExecutor(max_workers=n_threads) as ex:
+        futures = {ex.submit(_worker, (i, url)): i for i, url in enumerate(urls)}
+        for fut in as_completed(futures):
+            idx, local = fut.result()
+            if local is None:
+                n_skipped += 1
+            else:
+                local_paths[idx] = local
+
+    # Filter out failed downloads
+    result = [p for p in local_paths if p is not None]
+    if n_skipped:
+        _tprint(f"⚠️ {n_skipped}/{len(urls)} 个文件下载失败 (404/不存在), "
+                f"成功 {len(result)}/{len(urls)}")
+    return result
+
+
+def _assemble_cycle(
+    urls: List[str],
+    workdir: Path,
+    direct: bool = True,
+    chunk_lat: int = 181,
+    chunk_lon: int = 360,
+    write_nc: bool = True,
+    download_threads: int = 8,
+    parse_workers: int = 8,
+    grib_dir: Path | None = None,
+    keep_grib: bool = False,
+    executor=None,
+) -> Path:
+    """
+    Download + parse one GFS forecast cycle into a NetCDF file.
+
+    Parameters
+    ----------
+    download_threads : parallel S3 download threads (default 8)
+    parse_workers   : ProcessPoolExecutor workers for per-file cfgrib extraction (default 8)
+    grib_dir        : override GRIB cache root (default: workdir/grib_cache).
+                      Set to /dev/shm/grib_cache to use RAM-backed tmpfs.
+    keep_grib       : if False (default), delete GRIB files immediately after NC is
+                      written to free disk/RAM space.
+    executor        : optional shared ProcessPoolExecutor for cfgrib parsing.
+    """
+    cache_dir = grib_dir if grib_dir is not None else workdir / "grib_cache"
+
+    # ── Step 1: infer init_dt and valid_times from URL metadata ───────────────
+    init_dt: datetime | None = None
+    valid_times: list[pd.Timestamp] = []
+    for url in urls:
+        fname = url.split("/")[-1]
+        if init_dt is None:
+            segs = url.strip("/").split("/")
+            for i, seg in enumerate(segs):
+                if seg.startswith("gfs.") and len(seg) == 12:
+                    day_part = seg.replace("gfs.", "")
+                    cycle_part = segs[i + 1] if i + 1 < len(segs) else "00"
+                    try:
+                        init_dt = datetime.strptime(day_part + cycle_part, "%Y%m%d%H").replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+                    break
+        try:
+            fhour = int(fname.split("f")[-1])
+        except Exception:
+            fhour = None
+        if init_dt and fhour is not None:
+            valid_times.append(pd.to_datetime(init_dt + timedelta(hours=fhour)))
+
+    out_dir = workdir / "grib_nc"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    init_tag = "unknown"
+    if valid_times:
+        init_tag = pd.to_datetime(valid_times[0]).strftime("%Y-%m-%d%H")
+    elif init_dt is not None:
+        init_tag = init_dt.strftime("%Y-%m-%d%H")
+
+    if not write_nc:
+        # Legacy: just write a .griblist without downloading or parsing
+        list_path = out_dir / f"gfs_{init_tag}_f000_f240_6h.griblist"
+        local_urls = [str(_url_to_local(u, cache_dir)) for u in urls]
+        with list_path.open("w", encoding="utf-8") as fh:
+            fh.writelines(f"{p}\n" for p in local_urls)
+        return list_path
+
+    out_path = out_dir / f"gfs_{init_tag}_f000_f240_6h.nc"
+    if out_path.exists():
+        # Validate: must be > 10 MB and contain all 4 data variables
+        # CRITICAL: netCDF4/HDF5 is NOT thread-safe — even reads must be serialized
+        try:
+            sz = out_path.stat().st_size
+            if sz > 10_000_000:  # 10 MB minimum for a valid NC (~93 MB expected)
+                with _nc_write_lock:
+                    import netCDF4 as _nc4
+                    with _nc4.Dataset(str(out_path)) as _ds:
+                        _vars = set(_ds.variables.keys())
+                if {"msl", "10u", "10v", "z"}.issubset(_vars):
+                    _tprint(f"⏭️ NC 已存在且完整，跳过: {out_path.name} ({sz/1e6:.0f}MB)")
+                    return out_path
+            # NC exists but is corrupt/incomplete — delete and rebuild
+            _tprint(f"⚠️ NC 存在但不完整 ({sz} bytes)，将重建: {out_path.name}")
+            out_path.unlink(missing_ok=True)
+        except Exception as exc:
+            _tprint(f"⚠️ NC 校验失败 ({exc})，将重建: {out_path.name}")
+            out_path.unlink(missing_ok=True)
+
+    # ── Step 2: Parallel S3 download ──────────────────────────────────────────
+    local_urls = _download_files_parallel(urls, cache_dir, n_threads=download_threads)
+    if not local_urls:
+        raise RuntimeError("No data downloaded for cycle (all 404?)")
+    if len(local_urls) < 5:
+        raise RuntimeError(
+            f"Only {len(local_urls)}/{len(urls)} GRIB files downloaded — "
+            f"too few for valid NC, skipping cycle"
+        )
+
+    # Recompute valid_times from actually downloaded files (some may be 404)
+    if valid_times and len(local_urls) != len(urls):
+        actual_vt = []
+        for p in local_urls:
+            fname = Path(p).name
+            try:
+                fh = int(fname.split("f")[-1])
+            except (ValueError, IndexError):
+                continue
+            if init_dt:
+                actual_vt.append(pd.to_datetime(init_dt + timedelta(hours=fh)))
+        if actual_vt:
+            valid_times = actual_vt
+            _tprint(f"⚠️ valid_times 重建: {len(actual_vt)}/{len(urls)} 时间点 "
+                    f"(部分GRIB不存在)")
+
+    # ── Step 3: Fast per-file parallel cfgrib extraction ──────────────────────
+    # open_grib_collection_fast processes each file ONCE in a worker process,
+    # caches cfgrib indices alongside GRIB files for near-instant re-runs.
+    # Uses shared executor when provided (multi-cycle mode) to avoid spawning
+    # multiple ProcessPoolExecutors simultaneously from different threads.
+    ds = open_grib_collection_fast(
+        local_urls,
+        n_workers=parse_workers,
+        valid_times=valid_times if valid_times else None,
+        executor=executor,
+    )
+
+    # ── Step 4: Write NetCDF (numpy arrays already in memory, no dask) ────────
+    # time coord is already timezone-naive from open_grib_collection_fast
+    # CRITICAL: netCDF4/HDF5 library is NOT thread-safe. Concurrent writes from
+    # multiple threads deadlock in HDF5 C code (0% CPU, no output). Must serialize.
+    lat_dim, lon_dim = ds.sizes["latitude"], ds.sizes["longitude"]
+    encoding = {
+        v: {"zlib": True, "complevel": 1, "chunksizes": (1, lat_dim, lon_dim)}
+        for v in ds.data_vars
+    }
+    _tprint(f"🔒 等待 NC 写入锁 ({out_path.name})...")
+    with _nc_write_lock:
+        ds.to_netcdf(out_path, engine="netcdf4", encoding=encoding)
+    ds.close()
+    _tprint(f"📝 NC 已写入: {out_path.name} ({out_path.stat().st_size/1e6:.0f}MB)")
+
+    # ── Step 5: Delete GRIB files to free disk/RAM ────────────────────────────
+    # By default (keep_grib=False) we delete the entire cycle's GRIB directory
+    # right after the NC is written; the NC is the only artifact we need going
+    # forward.  Pass keep_grib=True (--keep-grib CLI flag) to skip deletion.
+    if not keep_grib and local_urls:
+        import shutil as _shutil
+        cyc_dir = Path(local_urls[0]).parent
+        try:
+            _shutil.rmtree(cyc_dir, ignore_errors=True)
+            _tprint(f"🧹 已删除 GRIB 目录: {cyc_dir}")
+        except Exception as exc:
+            _tprint(f"⚠️ 删除 GRIB 目录失败: {exc}")
+
+    return out_path
+
+
+def group_urls_by_cycle(csv_path: Path) -> Dict[str, List[str]]:
+    df = pd.read_csv(csv_path)
+    required = {"day", "cycle", "s3_url"}
+    if not required.issubset(df.columns):
+        raise ValueError(f"URL CSV 缺少必要列: {required - set(df.columns)}")
+    grouped: Dict[str, List[str]] = defaultdict(list)
+    for _, row in df.iterrows():
+        key = f"{int(row['day'])}T{int(row['cycle']):02d}"
+        grouped[key].append(row["s3_url"])
+    for key in grouped:
+        grouped[key] = sorted(grouped[key])
+    return grouped
+
+
+def parse_cycle_list(raw: List[str]) -> List[str]:
+    clean = []
+    for s in raw:
+        s = s.strip().replace("-", "").replace(":", "")
+        if s.endswith(("00", "12")):
+            clean.append(s)
+    return clean
+
+
+def _assemble_only(
+    cyc: str,
+    urls: List[str],
+    args,
+    executor=None,
+) -> Path | None:
+    """
+    Phase 1: Download + cfgrib parse → write NetCDF. Thread-safe.
+
+    Does NOT touch HDF5/netCDF4 reading (only writes), so safe to run from
+    multiple threads simultaneously. Called by ThreadPoolExecutor in main().
+    executor: shared ProcessPoolExecutor for cfgrib parsing (avoids creating
+              multiple pools from concurrent threads).
+    """
+    import time as _time
+    t0 = _time.time()
+    n_files = len(urls)
+    _tprint(f"⬇️  [{cyc}] 开始下载 {n_files} 个 GRIB 文件 (download-threads={args.download_threads}, parse-workers={args.parse_workers})...")
+    try:
+        out_path = _assemble_cycle(
+            urls,
+            Path("data"),
+            write_nc=not args.no_nc,
+            download_threads=args.download_threads,
+            parse_workers=args.parse_workers,
+            grib_dir=Path(args.grib_dir) if getattr(args, "grib_dir", None) else None,
+            keep_grib=getattr(args, "keep_grib", False),
+            executor=executor,
+        )
+        elapsed = _time.time() - t0
+        _tprint(f"✅ [{cyc}] NC 就绪 ({elapsed:.0f}s): {out_path.name}")
+        return out_path
+    except Exception as exc:
+        import traceback
+        _tprint(f"❌ [{cyc}] 下载/解析失败: {exc}\n{traceback.format_exc()}")
+        return None
+
+
+def _run_full_cycle(
+    cyc: str,
+    urls: List[str],
+    args,
+) -> Path | None:
+    """Legacy single-cycle full pipeline (download+parse+track+extract). For cycle-workers=1."""
+    import time as _time
+    t0 = _time.time()
+    out_path = _assemble_only(cyc, urls, args)
+    if out_path is None:
+        return None
+
+    class _CycleArgs:
+        def __init__(self, a):
+            self.processes = 1
+            self.no_clean = a.keep_nc
+            self.keep_nc = a.keep_nc
+            self.auto = True
+            self.initials = a.initials
+            self.tracks = None
+
+    process_nc_files(
+        [out_path],
+        _CycleArgs(args),
+        concise_log=True,
+        logs_root=Path("final_single_output/logs"),
+    )
+    elapsed = _time.time() - t0
+    _tprint(f"🏁 [{cyc}] 全流程完成 ({elapsed:.0f}s)")
+    return out_path
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Assemble GFS GRIB cycles into NC and run tracking+extraction",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--urls", default="output/gfs_grib_urls_00_12_f000_f240_step6.csv")
+    parser.add_argument("--cycles", nargs="*", help="指定 cycle, 例如 20250731T00 20250731T12")
+    parser.add_argument("--max-cycles", type=int, default=1, help="最多处理的 cycles 数")
+
+    # ── 并行参数 (根据 CPU 核数自动调整) ─────────────────────────────────────
+    _def_cycle   = max(2, _N_CPU // 4)       # 24核→6
+    _def_dl      = max(4, _N_CPU // 2)       # 24核→12
+    _def_parse   = max(4, _N_CPU - 4)        # 24核→20
+    _def_extract = max(1, _N_CPU // 2)       # 24核→12
+
+    parser.add_argument("--cycle-workers",    type=int, default=_def_cycle,
+                        help=f"同时处理的 cycle 数量 (线程级并发, 自动={_def_cycle}, {_N_CPU}核)")
+    parser.add_argument("--download-threads", type=int, default=_def_dl,
+                        help=f"每个 cycle 的 S3 并发下载线程数 (自动={_def_dl})")
+    parser.add_argument("--parse-workers",    type=int, default=_def_parse,
+                        help=f"cfgrib 解析进程数 — 所有 cycle 共享 (自动={_def_parse})")
+    parser.add_argument("--processes",        type=int, default=_def_extract,
+                        help=f"阶段2环境提取并行进程数 (自动={_def_extract})")
+
+    # ── 其他参数 ─────────────────────────────────────────────────────────────
+    parser.add_argument("--keep-nc",   action="store_true", help="处理后保留 NC 文件（测试用）")
+    parser.add_argument("--keep-grib", action="store_true", help="写 NC 后保留 GRIB 文件（测试用）")
+    parser.add_argument(
+        "--grib-dir", default=None,
+        help="GRIB 缓存目录 (默认自动选择: /dev/shm/grib_cache 若可用, 否则 data/grib_cache)",
+    )
+    parser.add_argument("--initials", default="input/western_pacific_typhoons_superfast.csv")
+    parser.add_argument("--match-tracks", action="store_true",
+                        help="自动筛选与 --initials 气旋时间范围匹配的 cycles (忽略 --cycles/--max-cycles)")
+    parser.add_argument("--batch-size", type=int, default=0,
+                        help="每批处理的 cycle 数量 (0=不分批, 一次全部处理)")
+    parser.add_argument("--no-nc",    action="store_true", help="跳过 NC 写入，仅输出 .griblist")
+    args = parser.parse_args()
+
+    # ── 自动选择 GRIB 缓存目录 ────────────────────────────────────────────────
+    if args.grib_dir is None:
+        import shutil as _shutil
+        shm = Path("/dev/shm")
+        if shm.is_dir():
+            try:
+                free_gb = _shutil.disk_usage(str(shm)).free / 1e9
+                if free_gb > 20:
+                    args.grib_dir = str(shm / "grib_cache")
+                    print(f"📁 GRIB 目录: {args.grib_dir}  ({free_gb:.0f} GB 可用, RAM tmpfs)")
+            except Exception:
+                pass
+        if args.grib_dir is None:
+            args.grib_dir = "data/grib_cache"
+            import shutil as _shutil
+            free_gb = _shutil.disk_usage("data").free / 1e9
+            print(f"📁 GRIB 目录: {args.grib_dir}  ({free_gb:.0f} GB 可用, 磁盘)")
+
+    all_groups = group_urls_by_cycle(Path(args.urls))
+    cycles = parse_cycle_list(args.cycles) if args.cycles else sorted(all_groups.keys())
+
+    # ── 按气旋生命周期筛选 cycles ──────────────────────────────────────────────
+    if args.match_tracks:
+        from datetime import timedelta as _td
+        tracks_df = pd.read_csv(args.initials)
+        tracks_df["datetime"] = pd.to_datetime(tracks_df["datetime"])
+        storm_col = "storm_id" if "storm_id" in tracks_df.columns else "SID"
+        storm_ranges = tracks_df.groupby(storm_col)["datetime"].agg(["min", "max"])
+        needed: set[str] = set()
+        for _, row in storm_ranges.iterrows():
+            s_start, s_end = row["min"], row["max"]
+            earliest = s_start - _td(days=10)  # f240 = 10 天预报
+            for cyc_tag in cycles:
+                try:
+                    cyc_dt = datetime.strptime(cyc_tag, "%Y%m%dT%H")
+                except ValueError:
+                    continue
+                if earliest <= cyc_dt <= s_end:
+                    needed.add(cyc_tag)
+        before = len(cycles)
+        cycles = sorted(c for c in cycles if c in needed)
+        print(f"🎯 match-tracks: {before} → {len(cycles)} cycles "
+              f"(匹配 {len(storm_ranges)} 个气旋的生命周期)")
+    elif args.max_cycles:
+        cycles = cycles[: args.max_cycles]
+
+    if not cycles:
+        raise SystemExit("No cycles to process")
+
+    import time as _time
+    t_start = _time.time()
+    total = len(cycles)
+
+    # ── batch-size: 分批处理, 每批下载→追踪→提取→清理 ────────────────────────
+    batch_size = args.batch_size if args.batch_size > 0 else max(12, args.cycle_workers * 3)
+
+    print(f"\n🚀 共 {total} 个 cycles  |  CPU={_N_CPU}核  |  RAM={_os.sysconf('SC_PAGE_SIZE')*_os.sysconf('SC_PHYS_PAGES')/1e9:.0f}GB")
+    print(f"   下载+解析: cycle-workers={args.cycle_workers}, "
+          f"download-threads={args.download_threads}, parse-workers={args.parse_workers}")
+    print(f"   追踪+提取: processes={args.processes}")
+    print(f"   流水线模式: 每 {batch_size} 个 cycles 一批 → 下载解析 → 追踪提取 → 清理NC → 下一批")
+    print(f"   共 {(total + batch_size - 1) // batch_size} 批\n")
+
+    import multiprocessing as _mp
+    shared_executor = __import__("concurrent.futures", fromlist=["ProcessPoolExecutor"]).ProcessPoolExecutor(
+        max_workers=args.parse_workers,
+        mp_context=_mp.get_context("spawn"),
+    )
+    print(f"   共享解析池: {args.parse_workers} spawn 进程\n")
+
+    class _RunArgs:
+        def __init__(self, a):
+            self.processes = a.processes
+            self.no_clean  = a.keep_nc
+            self.keep_nc   = a.keep_nc
+            self.auto      = True
+            self.initials  = a.initials
+            self.tracks    = None
+
+    total_processed = 0
+    total_skipped   = 0
+    total_errors    = 0
+
+    for batch_idx in range(0, total, batch_size):
+        batch_cycles = cycles[batch_idx : batch_idx + batch_size]
+        batch_num = batch_idx // batch_size + 1
+        n_batches = (total + batch_size - 1) // batch_size
+        batch_t0 = _time.time()
+        print(f"\n{'='*70}")
+        print(f"📦 批次 {batch_num}/{n_batches}  |  cycles {batch_idx+1}-{batch_idx+len(batch_cycles)}/{total}")
+        print(f"{'='*70}")
+
+        # ── 阶段A: 并行下载 + cfgrib 解析 → NC ───────────────────────────────
+        n_workers = min(args.cycle_workers, len(batch_cycles))
+        built_nc: List[Path] = []
+
+        if n_workers <= 1:
+            for cyc in batch_cycles:
+                urls = all_groups.get(cyc, [])
+                if urls:
+                    result = _assemble_only(cyc, urls, args, executor=shared_executor)
+                    if result:
+                        built_nc.append(result)
+        else:
+            with ThreadPoolExecutor(max_workers=n_workers) as tex:
+                fut_to_cyc = {
+                    tex.submit(_assemble_only, cyc, all_groups[cyc], args, shared_executor): cyc
+                    for cyc in batch_cycles
+                    if all_groups.get(cyc)
+                }
+                done_in_batch = 0
+                for fut in as_completed(fut_to_cyc):
+                    cyc = fut_to_cyc[fut]
+                    done_in_batch += 1
+                    try:
+                        result = fut.result()
+                        if result:
+                            built_nc.append(result)
+                    except Exception as exc:
+                        total_errors += 1
+                        _tprint(f"❌ [{cyc}] 异常: {exc}")
+                    overall_done = batch_idx + done_in_batch
+                    elapsed = _time.time() - t_start
+                    avg = elapsed / overall_done if overall_done else 0
+                    _tprint(f"📦 进度: {overall_done}/{total}  "
+                            f"已用时 {elapsed:.0f}s  平均 {avg:.1f}s/cycle  "
+                            f"预计剩余 {avg*(total-overall_done):.0f}s")
+
+        batch_dl_t = _time.time() - batch_t0
+        print(f"   ⬇️  批次{batch_num} 下载完成: {len(built_nc)} NCs, 用时 {batch_dl_t:.0f}s")
+
+        # ── 阶段B: 追踪 + 环境提取 (主进程) ──────────────────────────────────
+        if built_nc:
+            print(f"   🔍 批次{batch_num} 开始追踪+提取 ({len(built_nc)} NCs)...")
+            try:
+                processed, skipped = process_nc_files(
+                    built_nc,
+                    _RunArgs(args),
+                    concise_log=True,
+                    logs_root=Path("final_single_output/logs"),
+                )
+                total_processed += processed
+                total_skipped += skipped
+            except Exception as exc:
+                print(f"   ❌ 批次{batch_num} 追踪提取异常: {exc}")
+                import traceback; traceback.print_exc()
+
+        batch_elapsed = _time.time() - batch_t0
+        overall_elapsed = _time.time() - t_start
+        overall_done = min(batch_idx + len(batch_cycles), total)
+        remaining = total - overall_done
+        if overall_done > 0:
+            eta_s = overall_elapsed / overall_done * remaining
+        else:
+            eta_s = 0
+        print(f"   ✅ 批次{batch_num} 完成: {batch_elapsed:.0f}s | "
+              f"总进度 {overall_done}/{total} | "
+              f"已用 {overall_elapsed:.0f}s | "
+              f"预计剩余 {eta_s/60:.0f}min")
+
+    shared_executor.shutdown(wait=True)
+
+    total_elapsed = _time.time() - t_start
+    print(f"\n{'='*70}")
+    print(f"🎉 全部完成: {total} cycles")
+    print(f"   ✅ 已分析: {total_processed}")
+    print(f"   ⏭️ 跳过: {total_skipped}")
+    print(f"   ❌ 错误: {total_errors}")
+    print(f"   ⏱️ 总用时: {total_elapsed:.0f}s ({total_elapsed/3600:.1f}h)")
+    print(f"   📊 平均: {total_elapsed/max(total,1):.1f}s/cycle")
+    print(f"{'='*70}")
+
+
+if __name__ == "__main__":
+    main()

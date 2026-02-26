@@ -4,7 +4,12 @@ from .batching import _Metadata, _SimpleBatch
 from .dataset_adapter import _DsAdapter, _build_batch_from_ds, _build_batch_from_ds_fast, _safe_get, _to_0360
 from .exceptions import NoEyeException
 from .geo import extrapolate, get_box, get_closest_min, havdist
-from .initials import _load_all_points, _load_initial_points, _select_initials_for_time
+from .initials import (
+    _load_all_points,
+    _load_initial_points,
+    _select_initials_for_time,
+    _select_initials_for_window,
+)
 from .tracker import Tracker
 from .workflow import track_file_with_initials
 
@@ -14,6 +19,7 @@ __all__ = [
     "_load_all_points",
     "_load_initial_points",
     "_select_initials_for_time",
+    "_select_initials_for_window",
     "NoEyeException",
     "_Metadata",
     "_SimpleBatch",
