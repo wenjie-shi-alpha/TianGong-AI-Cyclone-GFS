@@ -48,11 +48,22 @@ class BaseExtractor:
             grib_paths = load_paths_from_griblist(p)
             self.ds = open_grib_collection(grib_paths)
         else:
-            self.ds = xr.open_dataset(
-                forecast_data_path,
-                chunks="auto",
-                cache=False,
-            )
+            try:
+                self.ds = xr.open_dataset(
+                    forecast_data_path,
+                    chunks="auto",
+                    cache=False,
+                )
+            except (ImportError, ValueError) as exc:
+                # xarray requires dask when chunks="auto"; degrade gracefully when unavailable.
+                if "chunk manager 'dask'" in str(exc) or "dask" in str(exc).lower():
+                    self.ds = xr.open_dataset(
+                        forecast_data_path,
+                        chunks=None,
+                        cache=False,
+                    )
+                else:
+                    raise
         try:
             p = Path(forecast_data_path)
             self.nc_filename = p.name

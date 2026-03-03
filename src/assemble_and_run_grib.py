@@ -307,7 +307,22 @@ def _assemble_cycle(
                     import netCDF4 as _nc4
                     with _nc4.Dataset(str(out_path)) as _ds:
                         _vars = set(_ds.variables.keys())
-                if {"msl", "10u", "10v", "z"}.issubset(_vars):
+                        dims_map = {
+                            name: tuple(_ds.variables[name].dimensions)
+                            for name in ("z", "u", "v", "t")
+                            if name in _ds.variables
+                        }
+                required = {"msl", "10u", "10v", "z", "u", "v", "t"}
+                has_required = required.issubset(_vars)
+                has_levels = False
+                if has_required:
+                    level_dim = "isobaricInhPa"
+                    z_dims = dims_map.get("z", ())
+                    u_dims = dims_map.get("u", ())
+                    v_dims = dims_map.get("v", ())
+                    t_dims = dims_map.get("t", ())
+                    has_levels = all(level_dim in dims for dims in (z_dims, u_dims, v_dims, t_dims))
+                if has_required and has_levels:
                     _tprint(f"⏭️ NC 已存在且完整，跳过: {out_path.name} ({sz/1e6:.0f}MB)")
                     return out_path
             _tprint(f"⚠️ NC 存在但不完整 ({sz} bytes)，将重建: {out_path.name}")
@@ -346,10 +361,15 @@ def _assemble_cycle(
 
     # ── Step 3: Write NetCDF ──────────────────────────────────────────────────
     lat_dim, lon_dim = ds.sizes["latitude"], ds.sizes["longitude"]
-    encoding = {
-        v: {"zlib": True, "complevel": 1, "chunksizes": (1, lat_dim, lon_dim)}
-        for v in ds.data_vars
-    }
+    encoding = {}
+    for var_name in ds.data_vars:
+        data_var = ds[var_name]
+        var_encoding = {"zlib": True, "complevel": 1}
+        if data_var.ndim == 3:
+            var_encoding["chunksizes"] = (1, lat_dim, lon_dim)
+        elif data_var.ndim == 4:
+            var_encoding["chunksizes"] = (1, 1, lat_dim, lon_dim)
+        encoding[var_name] = var_encoding
     _tprint(f"🔒 等待 NC 写入锁 ({out_path.name})...")
     with _nc_write_lock:
         ds.to_netcdf(out_path, engine="netcdf4", encoding=encoding)

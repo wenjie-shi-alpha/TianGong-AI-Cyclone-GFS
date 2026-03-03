@@ -23,14 +23,26 @@ except ImportError:
 
 def _extract_one_grib_file_worker(args: tuple) -> tuple:
     """
-    Worker process: extract msl, 10u, 10v, z700 from ONE GRIB file.
+    Worker process: extract mandatory + optional fields from ONE GRIB file.
 
     Uses a shared cfgrib index file (.idx) stored alongside the GRIB file.
     First call per file builds the index (~2s); subsequent calls read the
     index directly (~0.006s) — ~400x speedup on re-runs or when the same
     file is accessed for different variables.
 
-    Returns: (path, {'msl':arr,'10u':arr,'10v':arr,'z':arr}, lats, lons, valid_time)
+    Returns:
+      (
+        path,
+        {
+          'msl': arr2d, '10u': arr2d, '10v': arr2d,
+          'z': arr3d(level,lat,lon), 'u': arr3d, 'v': arr3d, 't': arr3d,
+          'q'?: arr3d, 'w'?: arr3d, 't2m'?: arr2d, 'sst'?: arr2d
+        },
+        lats,
+        lons,
+        valid_time,
+        {'z': levels, 'u': levels, ...}
+      )
     """
     path, idx_dir = args
     import cfgrib as _cfgrib
@@ -40,28 +52,51 @@ def _extract_one_grib_file_worker(args: tuple) -> tuple:
     os.makedirs(idx_dir, exist_ok=True)
     idx_path = os.path.join(idx_dir, os.path.basename(path) + ".idx")
 
-    QUERIES: list[tuple[str, dict]] = [
-        ("msl", {"shortName": "prmsl", "typeOfLevel": "meanSea"}),
-        ("10u", {"shortName": "10u",   "typeOfLevel": "heightAboveGround"}),
-        ("10v", {"shortName": "10v",   "typeOfLevel": "heightAboveGround"}),
-        ("z",   {"shortName": "gh",    "typeOfLevel": "isobaricInhPa"}),
+    QUERIES: list[tuple[str, dict, bool]] = [
+        ("msl", {"shortName": "prmsl", "typeOfLevel": "meanSea"}, True),
+        ("10u", {"shortName": "10u", "typeOfLevel": "heightAboveGround", "level": 10}, True),
+        ("10v", {"shortName": "10v", "typeOfLevel": "heightAboveGround", "level": 10}, True),
+        ("z", {"shortName": "gh", "typeOfLevel": "isobaricInhPa"}, True),
+        ("u", {"shortName": "u", "typeOfLevel": "isobaricInhPa"}, True),
+        ("v", {"shortName": "v", "typeOfLevel": "isobaricInhPa"}, True),
+        ("t", {"shortName": "t", "typeOfLevel": "isobaricInhPa"}, True),
+        ("q", {"shortName": "q", "typeOfLevel": "isobaricInhPa"}, False),
+        ("w", {"shortName": "w", "typeOfLevel": "isobaricInhPa"}, False),
+        ("t2m", {"shortName": "2t", "typeOfLevel": "heightAboveGround", "level": 2}, False),
+        ("sst", {"shortName": "sst", "typeOfLevel": "surface"}, False),
     ]
 
     out: dict[str, _np.ndarray] = {}
     lats = lons = None
     valid_time = None
+    isobaric_levels: dict[str, _np.ndarray] = {}
 
-    for var_name, fkeys in QUERIES:
-        ds = _cfgrib.open_dataset(path, filter_by_keys=fkeys, indexpath=idx_path)
-        if var_name == "z":
-            arr = ds["gh"].values
-            if "isobaricInhPa" in ds.coords and arr.ndim == 3:
-                lev = _np.asarray(ds["isobaricInhPa"])
-                arr = arr[int(_np.argmin(_np.abs(lev - 700.0)))]
-            out["z"] = arr.squeeze()
+    for var_name, fkeys, required in QUERIES:
+        try:
+            ds = _cfgrib.open_dataset(path, filter_by_keys=fkeys, indexpath=idx_path)
+        except Exception:
+            if required:
+                raise
+            continue
+
+        if var_name == "z" and "gh" in ds.data_vars:
+            arr = _np.asarray(ds["gh"].values)
+        elif var_name in {"u", "v", "t", "q", "w"} and var_name in ds.data_vars:
+            arr = _np.asarray(ds[var_name].values)
         else:
             orig = list(ds.data_vars)[0]
-            out[var_name] = ds[orig].values.squeeze()
+            arr = _np.asarray(ds[orig].values)
+
+        if "isobaricInhPa" in ds.coords:
+            levels = _np.asarray(ds["isobaricInhPa"].values, dtype=float).reshape(-1)
+            isobaric_levels[var_name] = levels
+            if arr.ndim == 2:
+                arr = arr[_np.newaxis, :, :]
+        else:
+            arr = arr.squeeze()
+
+        out[var_name] = arr
+
         if lats is None and "latitude" in ds.coords:
             lats = _np.asarray(ds["latitude"])
             lons = _np.asarray(ds["longitude"])
@@ -74,7 +109,7 @@ def _extract_one_grib_file_worker(args: tuple) -> tuple:
                     except Exception:
                         pass
 
-    return path, out, lats, lons, valid_time
+    return path, out, lats, lons, valid_time, isobaric_levels
 
 
 def open_grib_collection_fast(
@@ -87,7 +122,8 @@ def open_grib_collection_fast(
     Fast parallel GRIB → xarray Dataset.
 
     Each of the N GRIB files is processed ONCE in a dedicated worker process
-    (extracting all 4 variables together). A shared cfgrib index file is
+    (extracting mandatory multi-level fields + optional auxiliaries together).
+    A shared cfgrib index file is
     written next to each GRIB file on first access so subsequent runs skip
     the full-file scan entirely.
 
@@ -155,22 +191,55 @@ def open_grib_collection_fast(
     if time_idx.tz is not None:
         time_idx = time_idx.tz_convert("UTC").tz_localize(None)
 
-    msl_arr = np.stack([r[1]["msl"] for r in ordered], axis=0)
-    u10_arr = np.stack([r[1]["10u"] for r in ordered], axis=0)
-    v10_arr = np.stack([r[1]["10v"] for r in ordered], axis=0)
-    z_arr   = np.stack([r[1]["z"]   for r in ordered], axis=0)
+    common_vars = set(ordered[0][1].keys())
+    for rec in ordered[1:]:
+        common_vars &= set(rec[1].keys())
+
+    required = {"msl", "10u", "10v", "z", "u", "v", "t"}
+    missing_required = sorted(required - common_vars)
+    if missing_required:
+        raise RuntimeError(
+            f"GRIB fields missing after extraction: {missing_required}. "
+            f"Available common fields: {sorted(common_vars)}"
+        )
+
+    isobaric_vars = {"z", "u", "v", "t", "q", "w"}
+    levels = None
+    for rec in ordered:
+        level_map = rec[5]
+        if "z" in level_map and level_map["z"].size:
+            levels = np.asarray(level_map["z"], dtype=float).reshape(-1)
+            break
+    if levels is None:
+        raise RuntimeError("Missing isobaric coordinate for mandatory field 'z'")
+
+    data_vars: dict[str, tuple[list[str], np.ndarray]] = {}
+    for var in sorted(common_vars):
+        stacked = np.stack([np.asarray(rec[1][var]) for rec in ordered], axis=0)
+        if var in isobaric_vars:
+            if stacked.ndim != 4:
+                raise RuntimeError(
+                    f"Field '{var}' should be 4D after stacking (time,level,lat,lon), got shape={stacked.shape}"
+                )
+            if stacked.shape[1] != levels.size:
+                raise RuntimeError(
+                    f"Field '{var}' level size mismatch: {stacked.shape[1]} vs {levels.size}"
+                )
+            data_vars[var] = (["time", "isobaricInhPa", "latitude", "longitude"], stacked)
+        else:
+            if stacked.ndim != 3:
+                raise RuntimeError(
+                    f"Field '{var}' should be 3D after stacking (time,lat,lon), got shape={stacked.shape}"
+                )
+            data_vars[var] = (["time", "latitude", "longitude"], stacked)
 
     ds = xr.Dataset(
-        {
-            "msl": (["time", "latitude", "longitude"], msl_arr),
-            "10u": (["time", "latitude", "longitude"], u10_arr),
-            "10v": (["time", "latitude", "longitude"], v10_arr),
-            "z":   (["time", "latitude", "longitude"], z_arr),
-        },
+        data_vars,
         coords={
-            "time":      time_idx,
-            "latitude":  lats,
+            "time": time_idx,
+            "latitude": lats,
             "longitude": lons,
+            "isobaricInhPa": levels,
         },
     )
     return ds.sortby("time")
@@ -273,21 +342,52 @@ def open_grib_collection(
     if valid_times is None:
         valid_times = _build_valid_times(path_list)
 
-    msl = _open_mf_field(
-        path_list, {"shortName": "prmsl", "typeOfLevel": "meanSea"}, rename={"prmsl": "msl"}, chunk_lat=chunk_lat, chunk_lon=chunk_lon, prefer_dask=prefer_dask
-    )
-    u10 = _open_mf_field(
-        path_list, {"shortName": "10u", "typeOfLevel": "heightAboveGround"}, rename={"u10": "10u"}, chunk_lat=chunk_lat, chunk_lon=chunk_lon, prefer_dask=prefer_dask
-    )
-    v10 = _open_mf_field(
-        path_list, {"shortName": "10v", "typeOfLevel": "heightAboveGround"}, rename={"v10": "10v"}, chunk_lat=chunk_lat, chunk_lon=chunk_lon, prefer_dask=prefer_dask
-    )
-    gh = _open_mf_field(
-        path_list, {"shortName": "gh", "typeOfLevel": "isobaricInhPa"}, chunk_lat=chunk_lat, chunk_lon=chunk_lon, prefer_dask=prefer_dask
-    )
-    gh = gh.sel(isobaricInhPa=700, method="nearest").drop_vars("isobaricInhPa", errors="ignore").rename({"gh": "z"})
+    def _rename_first_var(ds_in: xr.Dataset, new_name: str) -> xr.Dataset:
+        first = list(ds_in.data_vars)[0]
+        return ds_in.rename({first: new_name})
 
-    ds = xr.merge([msl, u10, v10, gh], compat="override")
+    fields: list[xr.Dataset] = []
+
+    mandatory_queries = [
+        ("msl", {"shortName": "prmsl", "typeOfLevel": "meanSea"}),
+        ("10u", {"shortName": "10u", "typeOfLevel": "heightAboveGround", "level": 10}),
+        ("10v", {"shortName": "10v", "typeOfLevel": "heightAboveGround", "level": 10}),
+        ("z", {"shortName": "gh", "typeOfLevel": "isobaricInhPa"}),
+        ("u", {"shortName": "u", "typeOfLevel": "isobaricInhPa"}),
+        ("v", {"shortName": "v", "typeOfLevel": "isobaricInhPa"}),
+        ("t", {"shortName": "t", "typeOfLevel": "isobaricInhPa"}),
+    ]
+    optional_queries = [
+        ("q", {"shortName": "q", "typeOfLevel": "isobaricInhPa"}),
+        ("w", {"shortName": "w", "typeOfLevel": "isobaricInhPa"}),
+        ("t2m", {"shortName": "2t", "typeOfLevel": "heightAboveGround", "level": 2}),
+        ("sst", {"shortName": "sst", "typeOfLevel": "surface"}),
+    ]
+
+    for out_name, keys in mandatory_queries:
+        ds_field = _open_mf_field(
+            path_list,
+            keys,
+            chunk_lat=chunk_lat,
+            chunk_lon=chunk_lon,
+            prefer_dask=prefer_dask,
+        )
+        fields.append(_rename_first_var(ds_field, out_name))
+
+    for out_name, keys in optional_queries:
+        try:
+            ds_field = _open_mf_field(
+                path_list,
+                keys,
+                chunk_lat=chunk_lat,
+                chunk_lon=chunk_lon,
+                prefer_dask=prefer_dask,
+            )
+        except Exception:
+            continue
+        fields.append(_rename_first_var(ds_field, out_name))
+
+    ds = xr.merge(fields, compat="override")
     if valid_times and "time" in ds.sizes and len(valid_times) == ds.sizes["time"]:
         ds = ds.assign_coords(time=("time", pd.to_datetime(valid_times)))
     elif valid_times and "time" in ds.sizes:

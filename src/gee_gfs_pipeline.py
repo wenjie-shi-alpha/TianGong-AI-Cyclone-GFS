@@ -19,11 +19,9 @@ from typing import Any, Dict, Sequence
 
 import ee
 import pandas as pd
-import numpy as np
 from ee.ee_exception import EEException
 
 from initial_tracker.initials import _load_all_points, _select_initials_for_time
-from environment_extractor.extractor import TCEnvironmentalSystemsExtractor
 
 DEFAULT_BAND_MAP = {
     "msl": "mean_sea_level_pressure",
@@ -32,16 +30,6 @@ DEFAULT_BAND_MAP = {
     "precipitable_water": "precipitable_water_entire_atmosphere",
     "temp2m": "temperature_2m_above_ground",
     "rh2m": "relative_humidity_2m_above_ground",
-}
-
-# Mapping for extraction (GEE Band -> Standard Name)
-EXTRACTION_BAND_MAP = {
-    "geopotential_height_isobaric": "z",
-    "temperature_isobaric": "t",
-    "u_component_of_wind_isobaric": "u",
-    "v_component_of_wind_isobaric": "v",
-    "specific_humidity_isobaric": "q",
-    "vertical_velocity_isobaric": "w",
 }
 
 EE_MAX_PIXELS = 1_000_000_000
@@ -60,6 +48,15 @@ def _to_180(lon: float) -> float:
 
 def _hours_to_millis(hours: float) -> int:
     return int(hours * 3600 * 1000)
+
+
+def _to_utc_iso(ts: pd.Timestamp | str) -> str:
+    stamp = pd.Timestamp(ts)
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    else:
+        stamp = stamp.tz_convert("UTC")
+    return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _ensure_dir(path: Path) -> None:
@@ -125,6 +122,12 @@ class GEERemotePipeline:
         self._ensure_ee_initialized()
         self.available_bands = self._discover_bands()
         self.active_band_map = self._build_active_band_map()
+        if not any("isobaric" in name for name in self.available_bands):
+            logging.warning(
+                "Dataset %s does not expose pressure-level bands in GEE; "
+                "this pipeline will output tracking + near-surface environmental summaries only.",
+                self.cfg.dataset_id,
+            )
         # Load Land-Sea Mask (1=Land, 0=Water)
         # Using MODIS/006/MOD44W which has 'water_mask' (1=Water, 0=Land)
         self.lsm_image = ee.Image("MODIS/006/MOD44W").select("water_mask").unmask(0).not_().rename("lsm")
@@ -216,10 +219,12 @@ class GEERemotePipeline:
         if forecast_init:
             # Filter by specific forecast initialization time
             # GFS 'system:time_start' is the initialization time
-            collection = collection.filterDate(forecast_init.isoformat(), forecast_init.advance(1, "hour").isoformat())
+            init_start = _to_utc_iso(forecast_init)
+            init_end = _to_utc_iso(pd.Timestamp(forecast_init) + pd.Timedelta(hours=1))
+            collection = collection.filterDate(init_start, init_end)
         else:
             # Fallback to window around valid time (approximate)
-            collection = collection.filterDate(start.isoformat(), end.isoformat())
+            collection = collection.filterDate(_to_utc_iso(start), _to_utc_iso(end))
             
         collection = (
             collection
