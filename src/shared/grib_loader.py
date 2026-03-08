@@ -63,6 +63,7 @@ def _extract_one_grib_file_worker(args: tuple) -> tuple:
         ("q", {"shortName": "q", "typeOfLevel": "isobaricInhPa"}, False),
         ("w", {"shortName": "w", "typeOfLevel": "isobaricInhPa"}, False),
         ("t2m", {"shortName": "2t", "typeOfLevel": "heightAboveGround", "level": 2}, False),
+        ("tsfc", {"shortName": "t", "typeOfLevel": "surface"}, False),
         ("sst", {"shortName": "sst", "typeOfLevel": "surface"}, False),
     ]
 
@@ -77,6 +78,16 @@ def _extract_one_grib_file_worker(args: tuple) -> tuple:
         except Exception:
             if required:
                 raise
+            continue
+
+        # cfgrib may return an empty Dataset (no data_vars) when the requested
+        # shortName/typeOfLevel combination is absent in a GRIB message. This is
+        # common for optional fields such as SST over some forecast files.
+        if len(ds.data_vars) == 0:
+            if required:
+                raise RuntimeError(
+                    f"Required GRIB field empty after filter: var={var_name}, keys={fkeys}, file={path}"
+                )
             continue
 
         if var_name == "z" and "gh" in ds.data_vars:
@@ -204,6 +215,7 @@ def open_grib_collection_fast(
         )
 
     isobaric_vars = {"z", "u", "v", "t", "q", "w"}
+    required_isobaric_vars = {"z", "u", "v", "t"}
     levels = None
     for rec in ordered:
         level_map = rec[5]
@@ -218,13 +230,20 @@ def open_grib_collection_fast(
         stacked = np.stack([np.asarray(rec[1][var]) for rec in ordered], axis=0)
         if var in isobaric_vars:
             if stacked.ndim != 4:
-                raise RuntimeError(
-                    f"Field '{var}' should be 4D after stacking (time,level,lat,lon), got shape={stacked.shape}"
-                )
+                if var in required_isobaric_vars:
+                    raise RuntimeError(
+                        f"Field '{var}' should be 4D after stacking (time,level,lat,lon), got shape={stacked.shape}"
+                    )
+                # Optional isobaric variable (e.g. q/w) with malformed shape.
+                continue
             if stacked.shape[1] != levels.size:
-                raise RuntimeError(
-                    f"Field '{var}' level size mismatch: {stacked.shape[1]} vs {levels.size}"
-                )
+                if var in required_isobaric_vars:
+                    raise RuntimeError(
+                        f"Field '{var}' level size mismatch: {stacked.shape[1]} vs {levels.size}"
+                    )
+                # Optional isobaric variable may have a reduced pressure-level set.
+                # Skip it to keep the primary mandatory fields usable.
+                continue
             data_vars[var] = (["time", "isobaricInhPa", "latitude", "longitude"], stacked)
         else:
             if stacked.ndim != 3:
@@ -361,6 +380,7 @@ def open_grib_collection(
         ("q", {"shortName": "q", "typeOfLevel": "isobaricInhPa"}),
         ("w", {"shortName": "w", "typeOfLevel": "isobaricInhPa"}),
         ("t2m", {"shortName": "2t", "typeOfLevel": "heightAboveGround", "level": 2}),
+        ("tsfc", {"shortName": "t", "typeOfLevel": "surface"}),
         ("sst", {"shortName": "sst", "typeOfLevel": "surface"}),
     ]
 

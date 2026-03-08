@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,7 +20,6 @@ from typing import Any, Dict, Sequence
 
 import ee
 import pandas as pd
-from ee.ee_exception import EEException
 
 from initial_tracker.initials import _load_all_points, _select_initials_for_time
 
@@ -59,6 +59,13 @@ def _to_utc_iso(ts: pd.Timestamp | str) -> str:
     return stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _to_cycle_prefix(ts: pd.Timestamp | str) -> str:
+    stamp = pd.Timestamp(ts)
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("UTC").tz_localize(None)
+    return stamp.strftime("%Y%m%d%H")
+
+
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
@@ -75,6 +82,7 @@ class TrackerOptions:
     failure_window_hours: float = 18.0
     wind_core_radius_km: float = 150.0
     lsm_threshold: float = 0.5  # Threshold for Land-Sea Mask (0=Ocean, 1=Land)
+    wind_snap_tolerance_ms: float = 0.8
 
 
 @dataclass
@@ -112,11 +120,17 @@ class GEERemotePipeline:
         output_cfg: OutputOptions,
         *,
         ee_project: str | None = None,
+        ee_service_account_key: Path | None = None,
+        request_sleep_sec: float = 0.5,
         band_map: dict[str, str] | None = None,
     ) -> None:
         self.cfg = pipeline_cfg
         self.output_cfg = output_cfg
         self.ee_project = ee_project
+        self.ee_service_account_key = ee_service_account_key
+        self.request_sleep_sec = max(float(request_sleep_sec), 0.0)
+        self.request_retry_count = 3
+        self.request_retry_base_sec = 1.0
         self.band_map = band_map or DEFAULT_BAND_MAP
         self._image_cache: dict[str, ee.Image] = {}
         self._ensure_ee_initialized()
@@ -128,17 +142,52 @@ class GEERemotePipeline:
                 "this pipeline will output tracking + near-surface environmental summaries only.",
                 self.cfg.dataset_id,
             )
-        # Load Land-Sea Mask (1=Land, 0=Water)
-        # Using MODIS/006/MOD44W which has 'water_mask' (1=Water, 0=Land)
-        self.lsm_image = ee.Image("MODIS/006/MOD44W").select("water_mask").unmask(0).not_().rename("lsm")
+        # Load Land-Sea Mask (1=Land, 0=Water). MOD44W is an ImageCollection in GEE.
+        # Use the newest available image; fallback to all-ocean mask if unavailable.
+        try:
+            lsm_src = (
+                ee.ImageCollection("MODIS/006/MOD44W")
+                .select("water_mask")
+                .sort("system:time_start", False)
+                .first()
+            )
+            self.lsm_image = ee.Image(lsm_src).unmask(0).Not().rename("lsm")
+        except Exception:  # noqa: BLE001
+            logging.warning("Failed to load MOD44W mask; fallback to ocean-only mask.")
+            self.lsm_image = ee.Image.constant(0).rename("lsm")
+
+    def _initialize_with_service_account(self) -> None:
+        key_path = self.ee_service_account_key
+        if key_path is None:
+            return
+        if not key_path.exists():
+            raise FileNotFoundError(f"service account key not found: {key_path}")
+        info = json.loads(key_path.read_text(encoding="utf-8"))
+        client_email = info.get("client_email")
+        if not client_email:
+            raise RuntimeError(f"service account key missing client_email: {key_path}")
+        credentials = ee.ServiceAccountCredentials(client_email, str(key_path))
+        if self.ee_project:
+            ee.Initialize(credentials=credentials, project=self.ee_project)
+        else:
+            ee.Initialize(credentials=credentials)
 
     def _ensure_ee_initialized(self) -> None:
+        if self.ee_service_account_key is not None:
+            self._initialize_with_service_account()
+            return
+
         try:
             if self.ee_project:
                 ee.Initialize(project=self.ee_project)
             else:
                 ee.Initialize()
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
+            if not sys.stdin.isatty():
+                raise RuntimeError(
+                    "Earth Engine auth failed in non-interactive mode. "
+                    "Provide --service-account-key-json for headless runs."
+                ) from exc
             logging.info("Earth Engine authentication required. Launching flow ...")
             ee.Authenticate()
             if self.ee_project:
@@ -146,11 +195,56 @@ class GEERemotePipeline:
             else:
                 ee.Initialize()
 
+    def _request_with_retry(
+        self,
+        fetch_fn: Any,
+        *,
+        context: str,
+        required: bool,
+    ) -> Any | None:
+        delay = self.request_retry_base_sec
+        for attempt in range(1, self.request_retry_count + 2):
+            try:
+                return fetch_fn()
+            except Exception as exc:  # noqa: BLE001
+                if attempt > self.request_retry_count:
+                    if required:
+                        logging.error(
+                            "GEE request failed after %d attempts (%s): %s",
+                            attempt,
+                            context,
+                            exc,
+                        )
+                        raise
+                    logging.warning(
+                        "GEE request failed after %d attempts (%s): %s",
+                        attempt,
+                        context,
+                        exc,
+                    )
+                    return None
+                logging.warning(
+                    "GEE request error (%s), retry %d/%d in %.1fs: %s",
+                    context,
+                    attempt,
+                    self.request_retry_count,
+                    delay,
+                    exc,
+                )
+                time.sleep(delay)
+                delay = min(delay * 2.0, 8.0)
+
     def _discover_bands(self) -> set[str]:
         sample = ee.ImageCollection(self.cfg.dataset_id).first()
         if sample is None:
             raise RuntimeError(f"Dataset {self.cfg.dataset_id} returned no images.")
-        names = sample.bandNames().getInfo()
+        names = self._request_with_retry(
+            lambda: sample.bandNames().getInfo(),
+            context=f"discover bands for {self.cfg.dataset_id}",
+            required=True,
+        )
+        if names is None:
+            raise RuntimeError(f"Unable to discover bands for dataset {self.cfg.dataset_id}.")
         return set(names)
 
     def _build_active_band_map(self) -> dict[str, str]:
@@ -161,10 +255,16 @@ class GEERemotePipeline:
                 active[key] = band
             else:
                 missing[key] = band
-        if "msl" not in active or "u10" not in active or "v10" not in active:
+        if "u10" not in active or "v10" not in active:
             raise RuntimeError(
-                "GFS collection is missing mandatory bands (msl, u10, v10). "
+                "GFS collection is missing mandatory bands (u10, v10). "
                 f"Available: {sorted(self.available_bands)}"
+            )
+        if "msl" not in active:
+            logging.warning(
+                "Band %s is unavailable in %s. Fallback tracking will use low-wind eye localization.",
+                self.band_map.get("msl"),
+                self.cfg.dataset_id,
             )
         if missing:
             logging.warning("Skipping unavailable bands: %s", ", ".join(missing.values()))
@@ -178,8 +278,10 @@ class GEERemotePipeline:
         u10 = image.select(band_map["u10"])
         v10 = image.select(band_map["v10"])
         wind = u10.hypot(v10).rename("wind_speed_10m")
-        msl = image.select(band_map["msl"]).rename("msl_pa")
-        augmented = image.addBands([wind, msl], overwrite=True)
+        augmented = image.addBands([wind], overwrite=True)
+        if "msl" in band_map:
+            msl = image.select(band_map["msl"]).rename("msl_pa")
+            augmented = augmented.addBands([msl], overwrite=True)
         if "precipitable_water" in band_map:
             augmented = augmented.addBands(
                 image.select(band_map["precipitable_water"]).rename("pw_entire"),
@@ -217,11 +319,10 @@ class GEERemotePipeline:
         collection = ee.ImageCollection(self.cfg.dataset_id)
         
         if forecast_init:
-            # Filter by specific forecast initialization time
-            # GFS 'system:time_start' is the initialization time
-            init_start = _to_utc_iso(forecast_init)
-            init_end = _to_utc_iso(pd.Timestamp(forecast_init) + pd.Timedelta(hours=1))
-            collection = collection.filterDate(init_start, init_end)
+            # Use cycle prefix (YYYYMMDDHH) on system:index to include all Fxxx
+            # members for one forecast initialization (e.g. 2021040912F000..F120).
+            cycle_prefix = _to_cycle_prefix(forecast_init)
+            collection = collection.filter(ee.Filter.stringStartsWith("system:index", cycle_prefix))
         else:
             # Fallback to window around valid time (approximate)
             collection = collection.filterDate(_to_utc_iso(start), _to_utc_iso(end))
@@ -271,21 +372,19 @@ class GEERemotePipeline:
         geometry: ee.Geometry,
         reducer: ee.Reducer,
     ) -> dict[str, Any] | None:
-        try:
-            data = (
-                image.select(band_name)
-                .reduceRegion(
-                    reducer=reducer,
-                    geometry=geometry,
-                    scale=self.cfg.tracker.reduction_scale_m,
-                    bestEffort=True,
-                    maxPixels=EE_MAX_PIXELS,
-                )
-                .getInfo()
+        data = self._request_with_retry(
+            lambda: image.select(band_name)
+            .reduceRegion(
+                reducer=reducer,
+                geometry=geometry,
+                scale=self.cfg.tracker.reduction_scale_m,
+                bestEffort=True,
+                maxPixels=EE_MAX_PIXELS,
             )
-        except EEException as exc:
-            logging.debug("reduceRegion failed for %s: %s", band_name, exc)
-            return None
+            .getInfo(),
+            context=f"reduceRegion:{band_name}",
+            required=False,
+        )
         return data
 
     def _search_eye(
@@ -295,6 +394,7 @@ class GEERemotePipeline:
         guess_lon0360: float,
     ) -> dict[str, Any] | None:
         tracker_cfg = self.cfg.tracker
+        has_msl = "msl" in self.active_band_map
         for delta in tracker_cfg.search_radii_deg:
             bbox = self._square_geometry(guess_lat, guess_lon0360, delta)
             
@@ -306,27 +406,33 @@ class GEERemotePipeline:
                     # Land detected in the search box, skip this radius
                     continue
 
-            stats = self._reduce_region(image, "msl_pa", bbox, ee.Reducer.min())
-            if not stats or "msl_pa" not in stats:
-                continue
-            center_pa = stats["msl_pa"]
-            snap_mask = image.select("msl_pa").lte(center_pa + tracker_cfg.snap_tolerance_pa)
-            try:
-                lonlat_stats = (
-                    ee.Image.pixelLonLat()
-                    .updateMask(snap_mask)
-                    .reduceRegion(
-                        reducer=ee.Reducer.mean(),
-                        geometry=bbox,
-                        scale=tracker_cfg.reduction_scale_m,
-                        bestEffort=True,
-                        maxPixels=EE_MAX_PIXELS,
-                    )
-                    .getInfo()
+            center_pa = None
+            if has_msl:
+                stats = self._reduce_region(image, "msl_pa", bbox, ee.Reducer.min())
+                if not stats or "msl_pa" not in stats:
+                    continue
+                center_pa = float(stats["msl_pa"])
+                snap_mask = image.select("msl_pa").lte(center_pa + tracker_cfg.snap_tolerance_pa)
+            else:
+                wind_min_stats = self._reduce_region(image, "wind_speed_10m", bbox, ee.Reducer.min())
+                if not wind_min_stats or "wind_speed_10m" not in wind_min_stats:
+                    continue
+                min_wind_ms = float(wind_min_stats["wind_speed_10m"])
+                snap_mask = image.select("wind_speed_10m").lte(min_wind_ms + tracker_cfg.wind_snap_tolerance_ms)
+            lonlat_stats = self._request_with_retry(
+                lambda: ee.Image.pixelLonLat()
+                .updateMask(snap_mask)
+                .reduceRegion(
+                    reducer=ee.Reducer.mean(),
+                    geometry=bbox,
+                    scale=tracker_cfg.reduction_scale_m,
+                    bestEffort=True,
+                    maxPixels=EE_MAX_PIXELS,
                 )
-            except EEException as exc:
-                logging.debug("pixelLonLat reduceRegion failed: %s", exc)
-                continue
+                .getInfo(),
+                context="reduceRegion:pixelLonLat",
+                required=False,
+            )
             if not lonlat_stats or "latitude" not in lonlat_stats or "longitude" not in lonlat_stats:
                 continue
             lat = float(lonlat_stats["latitude"])
@@ -335,17 +441,18 @@ class GEERemotePipeline:
             core = self._circle_geometry(lat, lon0360, tracker_cfg.wind_core_radius_km)
             wind_stats = self._reduce_region(image, "wind_speed_10m", core, ee.Reducer.max())
             wind_max = wind_stats.get("wind_speed_10m") if wind_stats else None
-            annulus = self._annulus_geometry(lat, lon0360, tracker_cfg.annulus_inner_km, tracker_cfg.annulus_outer_km)
-            periphery_stats = self._reduce_region(image, "msl_pa", annulus, ee.Reducer.mean())
             drop_hpa = None
-            if periphery_stats and "msl_pa" in periphery_stats:
-                drop_hpa = max((periphery_stats["msl_pa"] - center_pa) / 100.0, 0.0)
+            if has_msl and center_pa is not None:
+                annulus = self._annulus_geometry(lat, lon0360, tracker_cfg.annulus_inner_km, tracker_cfg.annulus_outer_km)
+                periphery_stats = self._reduce_region(image, "msl_pa", annulus, ee.Reducer.mean())
+                if periphery_stats and "msl_pa" in periphery_stats:
+                    drop_hpa = max((periphery_stats["msl_pa"] - center_pa) / 100.0, 0.0)
             return {
                 "lat": lat,
                 "lon_0360": lon0360,
                 "lon_-180": lon_geom,
                 "msl_pa": center_pa,
-                "msl_hpa": center_pa / 100.0,
+                "msl_hpa": (center_pa / 100.0) if center_pa is not None else None,
                 "wind_speed_ms": wind_max,
                 "pressure_drop_hpa": drop_hpa,
                 "search_radius_deg": delta,
@@ -403,7 +510,15 @@ class GEERemotePipeline:
         return results
 
     def _fetch_metadata(self, image: ee.Image) -> dict[str, Any]:
-        props = image.toDictionary(["system:index", "valid_time_iso", "valid_time_millis", "forecast_hours"]).getInfo()
+        props = self._request_with_retry(
+            lambda: image.toDictionary(
+                ["system:index", "valid_time_iso", "valid_time_millis", "forecast_hours"]
+            ).getInfo(),
+            context="fetch image metadata",
+            required=True,
+        )
+        if props is None:
+            raise RuntimeError("Failed to fetch GEE image metadata.")
         return {
             "image_id": props["system:index"],
             "valid_time_iso": props["valid_time_iso"],
@@ -423,10 +538,22 @@ class GEERemotePipeline:
         init_lat = float(init_row["init_lat"])
         init_lon0360 = _to_0360(float(init_row["init_lon"]))
         collection = self._build_collection(start, end, init_lat, init_lon0360, forecast_init=forecast_init)
-        count = int(collection.size().getInfo() or 0)
+        count_obj = self._request_with_retry(
+            lambda: collection.size().getInfo(),
+            context=f"collection size storm={storm_id}",
+            required=True,
+        )
+        count = int(count_obj or 0)
         if count == 0:
             logging.warning("[%s] No GFS images for requested window.", storm_id)
             return []
+        if forecast_init is not None and not self.cfg.analysis_only and count <= 1:
+            logging.warning(
+                "[%s] Only %d image(s) found for forecast cycle %s; tracking may be truncated.",
+                storm_id,
+                count,
+                pd.Timestamp(forecast_init).strftime("%Y-%m-%d %H:%M"),
+            )
         image_list = collection.toList(min(count, self.cfg.tracker.max_steps * 2))
         history: list[dict[str, Any]] = []
         fails = 0
@@ -529,13 +656,33 @@ class GEERemotePipeline:
     def run(
         self,
         initials_csv: Path,
-        start_time: str | None = None, # Kept for compatibility but logic changed
+        start_time: str | None = None,
         storm_filter: list[str] | None = None,
     ) -> None:
         df_all = _load_all_points(initials_csv)
 
         if storm_filter:
             df_all = df_all[df_all["storm_id"].isin(storm_filter)]
+
+        if start_time:
+            target_time = pd.to_datetime(start_time, utc=True).tz_convert(None)
+            forecast_id = target_time.strftime("%Y%m%d_%H%M")
+            logging.info("Processing single forecast cycle %s UTC ...", target_time.strftime("%Y-%m-%d %H:%M"))
+            for storm_id, group in df_all.groupby("storm_id"):
+                candidates = _select_initials_for_time(group, target_time, tol_hours=max(self.cfg.time_window_hours, 1))
+                if candidates.empty:
+                    continue
+                row = candidates.iloc[0]
+                logging.info("Processing storm %s @ cycle %s", storm_id, target_time.strftime("%Y-%m-%d %H:%M"))
+                history = self._track_single_storm(str(storm_id), row, forecast_init=target_time)
+                if not history:
+                    continue
+                output_id = f"{storm_id}_{forecast_id}"
+                self._write_outputs(output_id, history)
+                self._export_analysis_only(output_id, history)
+                if self.request_sleep_sec > 0:
+                    time.sleep(self.request_sleep_sec)
+            return
 
         for storm_id, group in df_all.groupby("storm_id"):
             logging.info("Processing storm %s ...", storm_id)
@@ -544,7 +691,7 @@ class GEERemotePipeline:
             storm_end = pd.to_datetime(group["dt"]).max()
 
             # Align forecast cycles to 6-hourly synoptic times, mirroring the notebook logic.
-            freq = "6H"
+            freq = "6h"
             init_times = pd.date_range(
                 storm_start.floor(freq),
                 storm_end.ceil(freq),
@@ -573,7 +720,8 @@ class GEERemotePipeline:
                 # Only persist analyzed results; no raw downloads.
                 self._export_analysis_only(f"{storm_id}_{forecast_id}", history)
 
-                time.sleep(0.5)
+                if self.request_sleep_sec > 0:
+                    time.sleep(self.request_sleep_sec)
 
 
 
@@ -634,8 +782,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--ee-project",
+        "--project",
+        dest="ee_project",
         default=None,
         help="Optional Earth Engine project ID (needed when your account is tied to a GCP project).",
+    )
+    parser.add_argument(
+        "--service-account-key-json",
+        type=Path,
+        default=None,
+        help="Optional service account key JSON for headless Earth Engine auth.",
+    )
+    parser.add_argument(
+        "--sleep-sec",
+        type=float,
+        default=0.5,
+        help="Sleep seconds between forecast jobs to reduce GEE throttling.",
     )
     parser.add_argument(
         "--spatial-pad-deg",
@@ -678,6 +840,8 @@ def main() -> None:
         pipeline_cfg,
         output_cfg,
         ee_project=args.ee_project,
+        ee_service_account_key=args.service_account_key_json,
+        request_sleep_sec=args.sleep_sec,
     )
     pipeline.run(args.initials_csv, start_time=args.start_time, storm_filter=args.storm_id)
 

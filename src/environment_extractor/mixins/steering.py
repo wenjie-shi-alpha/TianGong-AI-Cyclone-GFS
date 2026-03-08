@@ -50,9 +50,9 @@ class SteeringExtractionMixin:
                 subtropical_high_obj["shape"].update(
                     {
                         "detailed_analysis": enhanced_shape["detailed_analysis"],
-                        "shape_type": enhanced_shape["shape_type"],
-                        "orientation": enhanced_shape["orientation"],
-                        "complexity": enhanced_shape["complexity"],
+                        "shape_type": enhanced_shape.get("shape_type"),
+                        "orientation": enhanced_shape.get("orientation"),
+                        "complexity": enhanced_shape.get("complexity"),
                     }
                 )
                 if "coordinate_info" in enhanced_shape:

@@ -5,27 +5,46 @@
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
+#SBATCH --cpus-per-task=32
 #SBATCH --mem=240G
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --qos=normal
 #SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
 
 # --------------- Runtime knobs (override via sbatch --export=...) ---------------
-PROJECT_DIR="${PROJECT_DIR:-$HOME/TianGong-AI-Cyclone-GFS}"
-TRACKS_CSV="${TRACKS_CSV:-$PROJECT_DIR/input/matched_cyclone_tracks.csv}"
+DEFAULT_PROJECT_DIR="/scratch/users/ziqianx/TianGong-AI-Cyclone-GFS"
+PROJECT_DIR="${PROJECT_DIR:-$DEFAULT_PROJECT_DIR}"
+TRACKS_CSV="${TRACKS_CSV:-}"
 # 强制使用指定环境（用户要求）
 ENV_PREFIX="/scratch/users/ziqianx/conda/envs/cyclone"
 LEAD_DAYS="${LEAD_DAYS:-10}"
 CYCLES_PER_TASK="${CYCLES_PER_TASK:-32}"
 STORMS_FILTER="${STORMS_FILTER:-}"    # optional comma-separated storm ids
 KEEP_NC="${KEEP_NC:-0}"
+PIPELINE_MODE="${PIPELINE_MODE:-grib}"  # grib | gee | cds
+REQUIRE_FULL_ENV_EXTRACTION="${REQUIRE_FULL_ENV_EXTRACTION:-1}"
+ARRAY_CONCURRENCY="${ARRAY_CONCURRENCY:-1}"  # passed from submit script
+MAX_GLOBAL_DOWNLOAD_THREADS="${MAX_GLOBAL_DOWNLOAD_THREADS:-192}"
+GEE_PROJECT="${GEE_PROJECT:-eminent-glider-467006-r0}"
+GEE_SERVICE_ACCOUNT_KEY_JSON="${GEE_SERVICE_ACCOUNT_KEY_JSON:-}"
+GEE_OUTPUT_SUBDIR="${GEE_OUTPUT_SUBDIR:-gee_pipeline}"
+GEE_ANALYSIS_ONLY="${GEE_ANALYSIS_ONLY:-0}"
+GEE_MAX_FORECAST_HOUR="${GEE_MAX_FORECAST_HOUR:-120}"
+GEE_TIME_WINDOW_HOURS="${GEE_TIME_WINDOW_HOURS:-6}"
+GEE_TEMPORAL_SPAN_HOURS="${GEE_TEMPORAL_SPAN_HOURS:-120}"
+GEE_MAX_STEPS="${GEE_MAX_STEPS:-40}"
+GEE_SPATIAL_PAD_DEG="${GEE_SPATIAL_PAD_DEG:-12.0}"
+GEE_SLEEP_SEC="${GEE_SLEEP_SEC:-0.5}"
+CDS_OUTPUT_SUBDIR="${CDS_OUTPUT_SUBDIR:-cds_output}"
+CDS_WORKERS="${CDS_WORKERS:-4}"
+CDS_NO_CLEAN="${CDS_NO_CLEAN:-0}"
+CDS_MAX_POINTS="${CDS_MAX_POINTS:-}"
 
 # Optional output merge target (shared filesystem).
 # If empty, outputs stay in per-task RUN_DIR.
-MERGE_OUTPUT_ROOT="${MERGE_OUTPUT_ROOT:-$PROJECT_DIR/hpc_runs/${SLURM_JOB_ID}}"
+MERGE_OUTPUT_ROOT="${MERGE_OUTPUT_ROOT:-}"
 
 # --------------- Environment bootstrap ---------------
 if ! command -v module >/dev/null 2>&1; then
@@ -44,12 +63,54 @@ if command -v module >/dev/null 2>&1; then
   done
 fi
 
+# Try robust fallback resolution when running from OnDemand copies.
+if [[ ! -d "$PROJECT_DIR/src" ]]; then
+  CANDIDATES=(
+    "$DEFAULT_PROJECT_DIR"
+    "/scratch/users/${USER}/TianGong-AI-Cyclone-GFS"
+    "${SLURM_SUBMIT_DIR:-}"
+  )
+  for cand in "${CANDIDATES[@]}"; do
+    [[ -z "$cand" ]] && continue
+    if [[ -d "$cand/src" ]]; then
+      PROJECT_DIR="$cand"
+      break
+    fi
+  done
+fi
+
 if [[ ! -d "$PROJECT_DIR/src" ]]; then
   echo "❌ PROJECT_DIR invalid: $PROJECT_DIR"
   exit 2
 fi
+
+if [[ -z "$TRACKS_CSV" ]]; then
+  TRACKS_CSV="$PROJECT_DIR/input/matched_cyclone_tracks.csv"
+fi
+
 if [[ ! -f "$TRACKS_CSV" ]]; then
   echo "❌ TRACKS_CSV not found: $TRACKS_CSV"
+  exit 2
+fi
+
+if [[ -z "$MERGE_OUTPUT_ROOT" ]]; then
+  MERGE_OUTPUT_ROOT="$PROJECT_DIR/hpc_runs/${SLURM_JOB_ID}"
+fi
+
+if [[ "$PIPELINE_MODE" != "grib" && "$PIPELINE_MODE" != "gee" && "$PIPELINE_MODE" != "cds" ]]; then
+  echo "❌ Unsupported PIPELINE_MODE: $PIPELINE_MODE (expect grib, gee or cds)"
+  exit 2
+fi
+
+if [[ "$REQUIRE_FULL_ENV_EXTRACTION" == "1" && "$PIPELINE_MODE" == "gee" ]]; then
+  echo "❌ PIPELINE_MODE=gee does not support full GRIB->NC weather-system extraction."
+  echo "   Use PIPELINE_MODE=grib for full tracking + environmental systems."
+  echo "   If you intentionally want simplified GEE summaries, set REQUIRE_FULL_ENV_EXTRACTION=0."
+  exit 2
+fi
+
+if [[ -n "$GEE_SERVICE_ACCOUNT_KEY_JSON" && ! -f "$GEE_SERVICE_ACCOUNT_KEY_JSON" ]]; then
+  echo "❌ GEE_SERVICE_ACCOUNT_KEY_JSON not found: $GEE_SERVICE_ACCOUNT_KEY_JSON"
   exit 2
 fi
 
@@ -83,6 +144,19 @@ if [[ -z "${DOWNLOAD_THREADS:-}" ]]; then
   (( DOWNLOAD_THREADS > 24 )) && DOWNLOAD_THREADS=24
 fi
 
+# Guardrail: cap per-task downloader threads based on array concurrency budget,
+# so aggregate S3 request fan-out stays bounded.
+if [[ "$ARRAY_CONCURRENCY" =~ ^[0-9]+$ ]] && [[ "$MAX_GLOBAL_DOWNLOAD_THREADS" =~ ^[0-9]+$ ]]; then
+  (( ARRAY_CONCURRENCY < 1 )) && ARRAY_CONCURRENCY=1
+  (( MAX_GLOBAL_DOWNLOAD_THREADS < 8 )) && MAX_GLOBAL_DOWNLOAD_THREADS=8
+  PER_TASK_DL_CAP=$(( MAX_GLOBAL_DOWNLOAD_THREADS / ARRAY_CONCURRENCY ))
+  (( PER_TASK_DL_CAP < 4 )) && PER_TASK_DL_CAP=4
+  if (( DOWNLOAD_THREADS > PER_TASK_DL_CAP )); then
+    echo "⚠️ DOWNLOAD_THREADS capped: ${DOWNLOAD_THREADS} -> ${PER_TASK_DL_CAP} (ARRAY_CONCURRENCY=${ARRAY_CONCURRENCY}, MAX_GLOBAL_DOWNLOAD_THREADS=${MAX_GLOBAL_DOWNLOAD_THREADS})"
+    DOWNLOAD_THREADS="$PER_TASK_DL_CAP"
+  fi
+fi
+
 if [[ -z "${PARSE_WORKERS:-}" ]]; then
   PARSE_WORKERS=$(( CPUS - 8 ))
   (( PARSE_WORKERS < 8 )) && PARSE_WORKERS=8
@@ -104,7 +178,19 @@ export PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}"
 
 # --------------- Local fast workspace (avoid shared FS bottleneck) ---------------
 LOCAL_BASE="${SLURM_TMPDIR:-/tmp}"
-RUN_DIR="${RUN_DIR:-$LOCAL_BASE/gfs_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}}"
+ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
+ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-1}"
+
+# If the script is launched as a normal (non-array) Slurm job, process all cycles
+# in this single task instead of only the first chunk.
+if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+  CYCLES_PER_TASK_EFFECTIVE=999999999
+  echo "ℹ️ Non-array submission detected: running as single full-range task."
+else
+  CYCLES_PER_TASK_EFFECTIVE="$CYCLES_PER_TASK"
+fi
+
+RUN_DIR="${RUN_DIR:-$LOCAL_BASE/gfs_${SLURM_JOB_ID}_${ARRAY_TASK_ID}}"
 mkdir -p "$RUN_DIR"/{logs,input,output}
 cd "$RUN_DIR"
 
@@ -112,7 +198,7 @@ cp -f "$TRACKS_CSV" "input/tracks.csv"
 
 # --------------- Build non-overlapping cycle subset for this array task ---------------
 mapfile -t CYCLES < <(
-  "${ENV_RUNNER[@]}" python3 - "$PROJECT_DIR" "input/tracks.csv" "$LEAD_DAYS" "$CYCLES_PER_TASK" "${SLURM_ARRAY_TASK_ID:-0}" "${SLURM_ARRAY_TASK_COUNT:-1}" "$STORMS_FILTER" "$MERGE_OUTPUT_ROOT" <<'PY'
+  "${ENV_RUNNER[@]}" python3 - "$PROJECT_DIR" "input/tracks.csv" "$LEAD_DAYS" "$CYCLES_PER_TASK_EFFECTIVE" "$ARRAY_TASK_ID" "$ARRAY_TASK_COUNT" "$STORMS_FILTER" "$MERGE_OUTPUT_ROOT" "$PIPELINE_MODE" <<'PY'
 import os
 import sys
 import io
@@ -120,7 +206,7 @@ import contextlib
 from pathlib import Path
 from datetime import datetime
 
-project_dir, tracks_csv, lead_days, cycles_per_task, task_id, task_count, storms_filter, merge_root = sys.argv[1:]
+project_dir, tracks_csv, lead_days, cycles_per_task, task_id, task_count, storms_filter, merge_root, pipeline_mode = sys.argv[1:]
 lead_days = int(lead_days)
 cycles_per_task = int(cycles_per_task)
 task_id = int(task_id)
@@ -141,20 +227,23 @@ with contextlib.redirect_stdout(io.StringIO()):
     )
 all_tags = [dt.strftime("%Y%m%dT%H") for dt in cycle_dts]
 
-done_stems = set()
-final_dir = Path(merge_root) / "final_single_output"
-if final_dir.exists():
-    for jf in final_dir.glob("*_TC_Analysis_*.json"):
-        stem = jf.stem
-        if "_TC_Analysis_" in stem:
-            done_stems.add(stem.split("_TC_Analysis_", 1)[0])
+if pipeline_mode == "gee":
+    tags = all_tags
+else:
+    done_stems = set()
+    final_dir = Path(merge_root) / "final_single_output"
+    if final_dir.exists():
+        for jf in final_dir.glob("*_TC_Analysis_*.json"):
+            stem = jf.stem
+            if "_TC_Analysis_" in stem:
+                done_stems.add(stem.split("_TC_Analysis_", 1)[0])
 
-tags = []
-for tag in all_tags:
-    init_tag = datetime.strptime(tag, "%Y%m%dT%H").strftime("%Y-%m-%d%H")
-    nc_stem = f"gfs_{init_tag}_f000_f240_6h"
-    if nc_stem not in done_stems:
-        tags.append(tag)
+    tags = []
+    for tag in all_tags:
+        init_tag = datetime.strptime(tag, "%Y%m%dT%H").strftime("%Y-%m-%d%H")
+        nc_stem = f"gfs_{init_tag}_f000_f240_6h"
+        if nc_stem not in done_stems:
+            tags.append(tag)
 
 if not tags:
     sys.exit(0)
@@ -173,52 +262,122 @@ PY
 )
 
 if [[ ${#CYCLES[@]} -eq 0 ]]; then
-  echo "⏹️ No cycles assigned to this task (array_id=${SLURM_ARRAY_TASK_ID:-0}). Exit."
+  echo "⏹️ No cycles assigned to this task (array_id=${ARRAY_TASK_ID}). Exit."
   exit 0
 fi
 
 echo "=== Job meta ==="
 echo "HOST=$(hostname)"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
-echo "SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID:-}"
-echo "SLURM_ARRAY_TASK_COUNT=${SLURM_ARRAY_TASK_COUNT:-}"
+echo "SLURM_ARRAY_TASK_ID=${ARRAY_TASK_ID}"
+echo "SLURM_ARRAY_TASK_COUNT=${ARRAY_TASK_COUNT}"
 echo "RUN_DIR=$RUN_DIR"
 echo "PROJECT_DIR=$PROJECT_DIR"
+echo "PIPELINE_MODE=$PIPELINE_MODE"
 echo "CPUS=$CPUS CYCLE_WORKERS=$CYCLE_WORKERS DOWNLOAD_THREADS=$DOWNLOAD_THREADS PARSE_WORKERS=$PARSE_WORKERS EXTRACT_PROCESSES=$EXTRACT_PROCESSES"
-echo "Assigned cycles: ${#CYCLES[@]} (first=${CYCLES[0]}, last=${CYCLES[-1]})"
+echo "Assigned items: ${#CYCLES[@]} (first=${CYCLES[0]}, last=${CYCLES[-1]})"
 
-CMD=(
-  python3 -u "$PROJECT_DIR/src/assemble_and_run_grib.py"
-  --tracks "input/tracks.csv"
-  --cycles "${CYCLES[@]}"
-  --cycle-workers "$CYCLE_WORKERS"
-  --download-threads "$DOWNLOAD_THREADS"
-  --parse-workers "$PARSE_WORKERS"
-  --processes "$EXTRACT_PROCESSES"
-  --grib-dir "$RUN_DIR/grib_cache"
-)
+STATUS=0
+LOG_FILE="logs/run_${SLURM_JOB_ID}_${ARRAY_TASK_ID}.log"
 
-if [[ "$KEEP_NC" == "1" ]]; then
-  CMD+=(--keep-nc --keep-grib)
+if [[ "$PIPELINE_MODE" == "grib" || "$PIPELINE_MODE" == "cds" ]]; then
+  if [[ "$PIPELINE_MODE" == "cds" ]]; then
+    echo "ℹ️ PIPELINE_MODE=cds uses GFS/AWS GRIB cycle workflow."
+  fi
+  CMD=(
+    python3 -u "$PROJECT_DIR/src/assemble_and_run_grib.py"
+    --tracks "input/tracks.csv"
+    --cycles "${CYCLES[@]}"
+    --cycle-workers "$CYCLE_WORKERS"
+    --download-threads "$DOWNLOAD_THREADS"
+    --parse-workers "$PARSE_WORKERS"
+    --processes "$EXTRACT_PROCESSES"
+    --grib-dir "$RUN_DIR/grib_cache"
+  )
+
+  if [[ "$KEEP_NC" == "1" ]]; then
+    CMD+=(--keep-nc --keep-grib)
+  fi
+
+  set +e
+  "${ENV_RUNNER[@]}" "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
+  STATUS=${PIPESTATUS[0]}
+  set -e
+else
+  GEE_OUT_DIR="$RUN_DIR/$GEE_OUTPUT_SUBDIR"
+  mkdir -p "$GEE_OUT_DIR"
+
+  STORM_ARGS=()
+  if [[ -n "$STORMS_FILTER" ]]; then
+    IFS=',' read -r -a STORMS_ARR <<< "$STORMS_FILTER"
+    for sid in "${STORMS_ARR[@]}"; do
+      sid="${sid//[[:space:]]/}"
+      [[ -n "$sid" ]] && STORM_ARGS+=("$sid")
+    done
+  fi
+
+  for cycle_tag in "${CYCLES[@]}"; do
+    cycle_iso="${cycle_tag:0:4}-${cycle_tag:4:2}-${cycle_tag:6:2}T${cycle_tag:9:2}:00:00Z"
+    echo "▶️ GEE cycle: $cycle_tag ($cycle_iso)" | tee -a "$LOG_FILE"
+
+    GEE_CMD=(
+      python3 -u "$PROJECT_DIR/src/gee_gfs_pipeline.py"
+      --initials-csv "input/tracks.csv"
+      --start-time "$cycle_iso"
+      --time-window-hours "$GEE_TIME_WINDOW_HOURS"
+      --temporal-span-hours "$GEE_TEMPORAL_SPAN_HOURS"
+      --max-steps "$GEE_MAX_STEPS"
+      --max-forecast-hour "$GEE_MAX_FORECAST_HOUR"
+      --spatial-pad-deg "$GEE_SPATIAL_PAD_DEG"
+      --sleep-sec "$GEE_SLEEP_SEC"
+      --output-dir "$GEE_OUT_DIR"
+    )
+
+    if [[ "$GEE_ANALYSIS_ONLY" == "1" ]]; then
+      GEE_CMD+=(--analysis-only)
+    fi
+    if [[ -n "$GEE_PROJECT" ]]; then
+      GEE_CMD+=(--project "$GEE_PROJECT")
+    fi
+    if [[ -n "$GEE_SERVICE_ACCOUNT_KEY_JSON" ]]; then
+      GEE_CMD+=(--service-account-key-json "$GEE_SERVICE_ACCOUNT_KEY_JSON")
+    fi
+    if [[ ${#STORM_ARGS[@]} -gt 0 ]]; then
+      GEE_CMD+=(--storm-id "${STORM_ARGS[@]}")
+    fi
+
+    set +e
+    "${ENV_RUNNER[@]}" "${GEE_CMD[@]}" 2>&1 | tee -a "$LOG_FILE"
+    CYCLE_STATUS=${PIPESTATUS[0]}
+    set -e
+    if [[ "$CYCLE_STATUS" -ne 0 ]]; then
+      STATUS="$CYCLE_STATUS"
+      echo "❌ GEE cycle failed: $cycle_tag (exit=$CYCLE_STATUS)" | tee -a "$LOG_FILE"
+      break
+    fi
+  done
 fi
-
-set +e
-"${ENV_RUNNER[@]}" "${CMD[@]}" 2>&1 | tee "logs/run_${SLURM_JOB_ID}_${SLURM_ARRAY_TASK_ID}.log"
-STATUS=${PIPESTATUS[0]}
-set -e
 
 echo "Pipeline exit code: $STATUS"
 
 # --------------- Merge outputs to shared storage ---------------
 if [[ -n "$MERGE_OUTPUT_ROOT" ]]; then
-  mkdir -p "$MERGE_OUTPUT_ROOT"/{final_single_output,track_single,logs}
-  if [[ -d "$RUN_DIR/final_single_output" ]]; then
-    rsync -a --ignore-existing "$RUN_DIR/final_single_output/" "$MERGE_OUTPUT_ROOT/final_single_output/"
+  if [[ "$PIPELINE_MODE" == "grib" || "$PIPELINE_MODE" == "cds" ]]; then
+    mkdir -p "$MERGE_OUTPUT_ROOT"/{final_single_output,track_single,logs}
+    if [[ -d "$RUN_DIR/final_single_output" ]]; then
+      rsync -a --ignore-existing "$RUN_DIR/final_single_output/" "$MERGE_OUTPUT_ROOT/final_single_output/"
+    fi
+    if [[ -d "$RUN_DIR/track_single" ]]; then
+      rsync -a --ignore-existing "$RUN_DIR/track_single/" "$MERGE_OUTPUT_ROOT/track_single/"
+    fi
+    rsync -a "$RUN_DIR/logs/" "$MERGE_OUTPUT_ROOT/logs/"
+  else
+    mkdir -p "$MERGE_OUTPUT_ROOT/$GEE_OUTPUT_SUBDIR" "$MERGE_OUTPUT_ROOT/logs"
+    if [[ -d "$RUN_DIR/$GEE_OUTPUT_SUBDIR" ]]; then
+      rsync -a --ignore-existing "$RUN_DIR/$GEE_OUTPUT_SUBDIR/" "$MERGE_OUTPUT_ROOT/$GEE_OUTPUT_SUBDIR/"
+    fi
+    rsync -a "$RUN_DIR/logs/" "$MERGE_OUTPUT_ROOT/logs/"
   fi
-  if [[ -d "$RUN_DIR/track_single" ]]; then
-    rsync -a --ignore-existing "$RUN_DIR/track_single/" "$MERGE_OUTPUT_ROOT/track_single/"
-  fi
-  rsync -a "$RUN_DIR/logs/" "$MERGE_OUTPUT_ROOT/logs/"
 fi
 
 exit "$STATUS"

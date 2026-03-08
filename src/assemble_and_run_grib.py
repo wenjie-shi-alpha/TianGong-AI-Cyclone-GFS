@@ -180,8 +180,23 @@ def generate_cycle_urls(cycle_dt: datetime) -> List[str]:
 # 第二步: 下载和解析
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _download_file(s3, url: str, dest: Path) -> bool:
-    """Download a single S3 file. Returns True on success, False on 404/missing."""
+def _download_file(
+    s3,
+    url: str,
+    dest: Path,
+    *,
+    max_retries: int = 6,
+    base_backoff_sec: float = 0.6,
+) -> bool:
+    """Download one S3 object with retry/backoff.
+
+    Returns True on success, False on permanent 404/missing.
+    Raises on repeated transient failures so the caller can decide whether to
+    skip the cycle.
+    """
+    import random
+    import time as _time
+
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.exists():
         return True
@@ -189,19 +204,66 @@ def _download_file(s3, url: str, dest: Path) -> bool:
         raise ValueError(f"Unsupported URL: {url}")
     _, _, bucket_key = url.partition("s3://")
     bucket, _, key = bucket_key.partition("/")
-    try:
-        s3.download_file(bucket, key, str(dest))
-        return True
-    except Exception as exc:
-        err_str = str(exc)
-        # Handle 404 / NoSuchKey gracefully
-        if hasattr(exc, "response"):
-            code = exc.response.get("Error", {}).get("Code", "")
-            if code in ("404", "NoSuchKey"):
+
+    transient_codes = {
+        "SlowDown",
+        "Throttling",
+        "ThrottlingException",
+        "RequestTimeout",
+        "RequestTimeTooSkewed",
+        "RequestExpired",
+        "InternalError",
+        "ServiceUnavailable",
+        "500",
+        "503",
+    }
+    transient_tokens = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "broken pipe",
+        "too many requests",
+        "slowdown",
+        "throttl",
+        "service unavailable",
+    )
+
+    for attempt in range(max_retries + 1):
+        try:
+            s3.download_file(bucket, key, str(dest))
+            return True
+        except Exception as exc:
+            err_str = str(exc)
+            err_lower = err_str.lower()
+            code = ""
+            if hasattr(exc, "response"):
+                code = str(exc.response.get("Error", {}).get("Code", "")).strip()
+
+            # 404 / object not found -> treat as normal miss
+            if code in {"404", "NoSuchKey", "NotFound"}:
                 return False
-        if "404" in err_str or "Not Found" in err_str or "NoSuchKey" in err_str:
-            return False
-        raise
+            if "404" in err_str or "not found" in err_lower or "nosuchkey" in err_lower:
+                return False
+
+            transient = False
+            if code in transient_codes:
+                transient = True
+            elif any(tok in err_lower for tok in transient_tokens):
+                transient = True
+
+            # Keep only complete files; partial writes may happen on interrupted transfers.
+            if dest.exists():
+                try:
+                    dest.unlink()
+                except Exception:
+                    pass
+
+            if transient and attempt < max_retries:
+                sleep_sec = min(base_backoff_sec * (2**attempt), 20.0) + random.uniform(0.0, 0.4)
+                _time.sleep(sleep_sec)
+                continue
+            raise
 
 
 def _url_to_local(url: str, cache_dir: Path) -> Path:
@@ -245,17 +307,27 @@ def _download_files_parallel(
     local_paths: list[str | None] = [None] * len(urls)
     n_skipped = 0
 
+    n_threads = max(1, int(n_threads))
+    s3 = boto3.client(
+        "s3",
+        config=Config(signature_version=UNSIGNED, max_pool_connections=max(32, n_threads * 2)),
+    )
+
     def _worker(idx_url: tuple[int, str]) -> tuple[int, str | None]:
         idx, url = idx_url
         local = _url_to_local(url, cache_dir)
-        s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED, max_pool_connections=50))
         ok = _download_file(s3, url, local)
         return idx, str(local) if ok else None
 
     with ThreadPoolExecutor(max_workers=n_threads) as ex:
         futures = {ex.submit(_worker, (i, url)): i for i, url in enumerate(urls)}
         for fut in as_completed(futures):
-            idx, local = fut.result()
+            try:
+                idx, local = fut.result()
+            except Exception as exc:
+                idx = futures[fut]
+                local = None
+                _tprint(f"⚠️ 下载失败(线程异常): idx={idx}, err={exc}")
             if local is None:
                 n_skipped += 1
             else:

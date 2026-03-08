@@ -77,6 +77,7 @@ class BaseExtractor:
         self.lon_180 = np.where(self.lon > 180, self.lon - 360, self.lon)
         self.lat_spacing = np.abs(np.diff(self.lat).mean())
         self.lon_spacing = np.abs(np.diff(self.lon).mean())
+        self._compat_report = self._validate_dataset_for_environment_systems()
 
         self._coslat = np.cos(np.deg2rad(self.lat))
         self._coslat_safe = np.where(np.abs(self._coslat) < 1e-6, np.nan, self._coslat)
@@ -123,6 +124,69 @@ class BaseExtractor:
             print("🔍 增强形状分析功能已启用（完整模式）")
         else:
             print("⚡ 形状分析快速模式已启用（跳过昂贵计算，性能提升 60-80%）")
+
+    def _validate_dataset_for_environment_systems(self) -> dict[str, Any]:
+        """Validate whether the loaded dataset can support full env-system extraction."""
+        report: dict[str, Any] = {
+            "required_isobaric_vars": ("z", "u", "v", "t"),
+            "required_levels_hpa": (1000, 925, 850, 700, 500, 300, 200),
+            "missing_vars": [],
+            "missing_levels_by_var": {},
+            "warnings": [],
+        }
+        required_levels = set(report["required_levels_hpa"])
+
+        for var_name in report["required_isobaric_vars"]:
+            if var_name not in self.ds.data_vars:
+                report["missing_vars"].append(var_name)
+                continue
+            var_data = self.ds[var_name]
+            level_dim = next(
+                (dim for dim in ["level", "isobaricInhPa", "pressure"] if dim in var_data.dims),
+                None,
+            )
+            if level_dim is None:
+                report["missing_levels_by_var"][var_name] = list(report["required_levels_hpa"])
+                continue
+            levels = np.asarray(self.ds[level_dim].values, dtype=float).reshape(-1)
+            available = {int(round(v)) for v in levels.tolist()}
+            missing = sorted(required_levels - available)
+            if missing:
+                report["missing_levels_by_var"][var_name] = missing
+
+        if "msl" not in self.ds.data_vars:
+            report["warnings"].append("msl 缺失: 季风槽的气压描述将退化。")
+        if (
+            "sst" not in self.ds.data_vars
+            and "tsfc" not in self.ds.data_vars
+            and "t2m" not in self.ds.data_vars
+        ):
+            report["warnings"].append("sst/tsfc/t2m 均缺失: 海洋热含量系统无法提取。")
+        if "w" not in self.ds.data_vars:
+            report["warnings"].append("w(垂直速度)缺失: ITCZ 的垂直运动描述将退化。")
+
+        missing_vars = report["missing_vars"]
+        missing_levels = report["missing_levels_by_var"]
+        if missing_vars or missing_levels:
+            details = []
+            if missing_vars:
+                details.append(f"缺失变量: {missing_vars}")
+            if missing_levels:
+                details.append(f"缺失压力层: {missing_levels}")
+            detail_text = "; ".join(details)
+            raise ValueError(
+                "预报数据与环境系统提取算法不兼容，无法进行完整天气系统提取。"
+                f"{detail_text}"
+            )
+
+        if report["warnings"]:
+            print("⚠️ 数据兼容性提示:")
+            for warning in report["warnings"]:
+                print(f"   - {warning}")
+        else:
+            print("✅ 数据兼容性检查通过: 关键变量与压力层完整。")
+
+        return report
 
     # --- 资源管理 ---
 
@@ -245,7 +309,7 @@ class BaseExtractor:
         return var_data.isel(time=time_idx, **{level_dim: level_idx}).values
 
     def _get_sst_field(self, time_idx):
-        for var_name in ["sst", "ts"]:
+        for var_name in ["sst", "ts", "tsfc"]:
             if var_name in self.ds.data_vars:
                 sst_data = self.ds[var_name].isel(time=time_idx).values
                 return sst_data - 273.15 if np.nanmean(sst_data) > 200 else sst_data
