@@ -164,15 +164,21 @@ def open_grib_collection_fast(
     if executor is not None:
         # 使用调用方提供的共享池 — 用 submit+as_completed 替代 map 以支持超时
         from concurrent.futures import as_completed as _as_completed
+        from concurrent.futures.process import BrokenProcessPool as _BrokenPool
+        timeout_sec = int(os.getenv("GFS_CFGRIB_TIMEOUT_SEC", "900"))
         futs = {executor.submit(_extract_one_grib_file_worker, item): i
                 for i, item in enumerate(work_items)}
         raw_ordered: list = [None] * len(work_items)
         try:
-            for fut in _as_completed(futs, timeout=300):  # 5 min timeout per batch
+            for fut in _as_completed(futs, timeout=timeout_sec):
                 raw_ordered[futs[fut]] = fut.result()
+        except _BrokenPool:
+            raise RuntimeError(
+                "cfgrib 子进程崩溃 (可能 OOM)，进程池已损坏"
+            )
         except TimeoutError:
             raise RuntimeError(
-                f"cfgrib 解析超时 (>300s), {sum(1 for r in raw_ordered if r is None)}/{len(work_items)} 个文件未完成"
+                f"cfgrib 解析超时 (>{timeout_sec}s), {sum(1 for r in raw_ordered if r is None)}/{len(work_items)} 个文件未完成"
             )
         raw = raw_ordered
     else:

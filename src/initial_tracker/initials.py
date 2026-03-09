@@ -60,49 +60,26 @@ def _select_initials_for_window(
     end_time: pd.Timestamp,
     tol_hours: int = 6,
 ) -> pd.DataFrame:
-    """Select one initial point per storm within a forecast window.
+    """Select one backward-nearest initial point per storm at cycle start.
 
     Strategy
     --------
-    1) Prefer the earliest point at/after `start_time` and within
-       `[start_time - tol, end_time + tol]`.
-    2) If no such point exists for a storm, fallback to the closest point
-       to `start_time` within the same widened window.
+    1) Only allow observed points with ``dt <= start_time`` (no future leakage).
+    2) Constrain candidates to ``[start_time - tol, start_time]``.
+    3) Pick the latest available point for each storm (backward nearest).
     """
     if df_all.empty:
         return pd.DataFrame(columns=["storm_id", "init_time", "init_lat", "init_lon"])
 
     delta = pd.Timedelta(hours=tol_hours) + pd.Timedelta(seconds=60)
     window = df_all.loc[
-        (df_all["dt"] >= start_time - delta) & (df_all["dt"] <= end_time + delta)
+        (df_all["dt"] >= start_time - delta) & (df_all["dt"] <= start_time)
     ].copy()
     if window.empty:
         return pd.DataFrame(columns=["storm_id", "init_time", "init_lat", "init_lon"])
 
-    after_start = window.loc[window["dt"] >= start_time].copy()
-    chosen_parts: list[pd.DataFrame] = []
-
-    if not after_start.empty:
-        idx_after = after_start.groupby("storm_id")["dt"].idxmin()
-        chosen_parts.append(after_start.loc[idx_after])
-
-    missing_storms = set(window["storm_id"].astype(str).unique())
-    if chosen_parts:
-        picked_storms = set(chosen_parts[0]["storm_id"].astype(str).unique())
-        missing_storms = missing_storms - picked_storms
-
-    if missing_storms:
-        fallback = window.loc[window["storm_id"].astype(str).isin(missing_storms)].copy()
-        if not fallback.empty:
-            fallback["time_diff"] = (fallback["dt"] - start_time).abs()
-            idx_fallback = fallback.groupby("storm_id")["time_diff"].idxmin()
-            chosen_parts.append(fallback.loc[idx_fallback])
-
-    if not chosen_parts:
-        return pd.DataFrame(columns=["storm_id", "init_time", "init_lat", "init_lon"])
-
-    pick = pd.concat(chosen_parts, ignore_index=True)
-    pick = pick.drop_duplicates(subset=["storm_id"], keep="first")
+    idx_latest = window.groupby("storm_id")["dt"].idxmax()
+    pick = window.loc[idx_latest].copy()
     pick = pick.rename(columns={"latitude": "init_lat", "longitude": "init_lon"})
     pick["init_time"] = pick["dt"].values
     cols = [

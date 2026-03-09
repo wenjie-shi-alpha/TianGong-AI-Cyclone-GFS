@@ -257,6 +257,8 @@ def streaming_from_csv(
 
     processed = 0
     skipped = pre_skipped
+    tracker_loaded_points = None
+    tracker_initials_path: Path | None = None
 
     if parallel:
         detail(
@@ -376,9 +378,19 @@ def streaming_from_csv(
                 try:
                     detail("🧭 使用 initialTracker 执行追踪...")
                     initials_path = initials_csv or Path("input/western_pacific_typhoons_superfast.csv")
-                    initials_df = it_load_initial_points(initials_path)
+                    if (
+                        tracker_loaded_points is None
+                        or tracker_initials_path is None
+                        or tracker_initials_path != initials_path
+                    ):
+                        tracker_loaded_points = it_load_initial_points(initials_path)
+                        tracker_initials_path = initials_path
+                        detail(
+                            f"📥 已加载初始点CSV: {initials_path} "
+                            f"({len(tracker_loaded_points)}条记录)"
+                        )
                     per_storm_csvs = it_track_file_with_initials(
-                        Path(nc_local), initials_df, track_dir
+                        Path(nc_local), tracker_loaded_points, track_dir
                     )
                     if not per_storm_csvs:
                         detail("⚠️ 无有效轨迹 -> 跳过环境分析")
@@ -503,6 +515,7 @@ def process_nc_files(
 ):
     """处理已准备好的 NC 文件列表，保持 legacy 行为不变。"""
     import pandas as pd
+    from collections import Counter
     from concurrent.futures import FIRST_COMPLETED, Future, ProcessPoolExecutor, wait
 
     def detail(message: str) -> None:
@@ -614,6 +627,12 @@ def process_nc_files(
 
     processed = 0
     skipped = pre_skipped
+    skip_reasons = Counter()
+    if pre_skipped:
+        skip_reasons["preexisting_json"] += pre_skipped
+    tracker_loaded_points = None
+    tracker_initials_path: Path | None = None
+    deferred_analysis_tasks: list[tuple[Path, Path, str]] = []
     for idx, nc_file in enumerate(target_nc_files, start=1):
         import re
 
@@ -625,8 +644,10 @@ def process_nc_files(
         detail(f"\n[{idx}/{len(target_nc_files)}] ▶️ 处理 NC: {nc_file.name}")
         existing_particles = existing_index.get(nc_stem, set())
         if existing_particles:
-            detail(f"⏭️  已存在分析结果 ({len(existing_particles)}) -> 跳过 {nc_stem}")
+            summary(f"⏭️  已存在分析结果 ({len(existing_particles)}) -> 跳过 {nc_stem}")
+            remove_nc_file(nc_file, "已有分析结果-跳过")
             skipped += 1
+            skip_reasons["preexisting_json_runtime"] += 1
             continue
 
         track_file = None
@@ -662,20 +683,36 @@ def process_nc_files(
                         if args.initials
                         else Path("input/western_pacific_typhoons_superfast.csv")
                     )
-                    initials_df = it_load_initial_points(initials_path)
+                    if (
+                        tracker_loaded_points is None
+                        or tracker_initials_path is None
+                        or tracker_initials_path != initials_path
+                    ):
+                        tracker_loaded_points = it_load_initial_points(initials_path)
+                        tracker_initials_path = initials_path
+                        detail(
+                            f"📥 已加载初始点CSV: {initials_path} "
+                            f"({len(tracker_loaded_points)}条记录)"
+                        )
                     out_dir = Path("track_single")
                     out_dir.mkdir(exist_ok=True)
-                    per_storm = it_track_file_with_initials(Path(nc_file), initials_df, out_dir)
+                    per_storm = it_track_file_with_initials(
+                        Path(nc_file),
+                        tracker_loaded_points,
+                        out_dir,
+                    )
                     if not per_storm:
-                        detail("⚠️ 无轨迹 -> 跳过该NC")
+                        summary(f"⚠️ [{nc_file.name}] initialTracker 返回空轨迹 -> 跳过")
                         remove_nc_file(nc_file, "无轨迹")
                         skipped += 1
+                        skip_reasons["tracker_empty"] += 1
                         continue
                     combined = combine_initial_tracker_outputs(per_storm, nc_file)
                     if combined is None or combined.empty:
-                        detail("⚠️ 自动追踪无有效轨迹 -> 跳过该NC")
+                        summary(f"⚠️ [{nc_file.name}] combine_initial_tracker_outputs 返回空 -> 跳过")
                         remove_nc_file(nc_file, "无轨迹")
                         skipped += 1
+                        skip_reasons["combine_empty"] += 1
                         continue
                     first_time = (
                         combined.iloc[0]["time"] if "time" in combined.columns else None
@@ -699,34 +736,19 @@ def process_nc_files(
                     summary(f"❌ 自动追踪失败: {e}")
                     remove_nc_file(nc_file, "追踪失败")
                     skipped += 1
+                    skip_reasons["tracking_exception"] += 1
                     continue
             else:
-                detail("⚠️ 未找到对应轨迹且未启用 --auto, 跳过")
+                summary(f"⚠️ [{nc_file.name}] 未找到轨迹且 auto=False -> 跳过")
                 remove_nc_file(nc_file, "无轨迹")
                 skipped += 1
+                skip_reasons["missing_track_auto_disabled"] += 1
                 continue
 
         detail(f"✅ 使用轨迹文件: {track_file}")
         if parallel and executor:
-            detail("🧮 已提交环境分析任务 (并行)")
-            log_file = (
-                str((logs_dir / f"{nc_file.stem}.log").resolve())
-                if logs_dir is not None and not concise_log
-                else None
-            )
-            future = executor.submit(
-                _run_environment_analysis,
-                str(nc_file),
-                str(track_file),
-                "final_single_output",
-                keep_nc_flag,
-                log_file,
-                concise_log,
-            )
-            meta: dict[str, str] = {"label": nc_file.name, "stem": nc_stem}
-            if log_file:
-                meta["log"] = log_file
-            active_futures[future] = meta
+            deferred_analysis_tasks.append((Path(nc_file), Path(track_file), nc_stem))
+            detail("🗂️  已完成追踪，环境分析将在追踪结束后统一并行执行")
         else:
             try:
                 success, error_msg, produced = _run_environment_analysis(
@@ -748,6 +770,33 @@ def process_nc_files(
                 summary(f"❌ 分析失败 {nc_file.name}: {e}")
                 continue
 
+    if parallel and executor and deferred_analysis_tasks:
+        detail(
+            f"\n🚀 开始并行环境分析: {len(deferred_analysis_tasks)} 个 NC, "
+            f"进程数={processes}"
+        )
+        for nc_file, track_file, nc_stem in deferred_analysis_tasks:
+            drain_completed(block=False)
+            ensure_capacity()
+            log_file = (
+                str((logs_dir / f"{nc_file.stem}.log").resolve())
+                if logs_dir is not None and not concise_log
+                else None
+            )
+            future = executor.submit(
+                _run_environment_analysis,
+                str(nc_file),
+                str(track_file),
+                "final_single_output",
+                keep_nc_flag,
+                log_file,
+                concise_log,
+            )
+            meta: dict[str, str] = {"label": nc_file.name, "stem": nc_stem}
+            if log_file:
+                meta["log"] = log_file
+            active_futures[future] = meta
+
     if parallel and executor:
         while active_futures:
             drain_completed(block=True)
@@ -756,6 +805,9 @@ def process_nc_files(
     summary("\n🎉 多文件环境分析完成. 统计:")
     summary(f"  ✅ 已分析: {processed}")
     summary(f"  ⏭️ 跳过(已有结果/无轨迹): {skipped}")
+    if skip_reasons:
+        reason_text = ", ".join(f"{k}={v}" for k, v in sorted(skip_reasons.items()))
+        summary(f"  🧾 跳过原因: {reason_text}")
     summary(f"  📦 实际遍历: {len(target_nc_files)} / 原始 {original_total}")
     summary("结果目录: final_single_output")
 
