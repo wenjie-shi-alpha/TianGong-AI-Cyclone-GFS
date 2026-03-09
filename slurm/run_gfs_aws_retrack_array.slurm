@@ -5,9 +5,9 @@
 #SBATCH --partition=normal
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=240G
-#SBATCH --time=48:00:00
+#SBATCH --cpus-per-task=3
+#SBATCH --mem=120G
+#SBATCH --time=24:00:00
 #SBATCH --qos=normal
 #SBATCH --mail-type=END,FAIL
 
@@ -25,6 +25,9 @@ STORMS_FILTER="${STORMS_FILTER:-}"    # optional comma-separated storm ids
 KEEP_NC="${KEEP_NC:-0}"
 PIPELINE_MODE="${PIPELINE_MODE:-grib}"  # grib | gee | cds
 REQUIRE_FULL_ENV_EXTRACTION="${REQUIRE_FULL_ENV_EXTRACTION:-1}"
+# 1: resume mode (skip cycles already merged under MERGE_OUTPUT_ROOT/final_single_output)
+# 0: always process all computed cycles
+RESUME_COMPLETED_CYCLES="${RESUME_COMPLETED_CYCLES:-1}"
 ARRAY_CONCURRENCY="${ARRAY_CONCURRENCY:-1}"  # passed from submit script
 MAX_GLOBAL_DOWNLOAD_THREADS="${MAX_GLOBAL_DOWNLOAD_THREADS:-192}"
 GEE_PROJECT="${GEE_PROJECT:-eminent-glider-467006-r0}"
@@ -99,6 +102,11 @@ fi
 
 if [[ "$PIPELINE_MODE" != "grib" && "$PIPELINE_MODE" != "gee" && "$PIPELINE_MODE" != "cds" ]]; then
   echo "❌ Unsupported PIPELINE_MODE: $PIPELINE_MODE (expect grib, gee or cds)"
+  exit 2
+fi
+
+if [[ "$RESUME_COMPLETED_CYCLES" != "0" && "$RESUME_COMPLETED_CYCLES" != "1" ]]; then
+  echo "❌ RESUME_COMPLETED_CYCLES must be 0 or 1, got: $RESUME_COMPLETED_CYCLES"
   exit 2
 fi
 
@@ -178,16 +186,18 @@ export PYTHONPATH="$PROJECT_DIR/src:${PYTHONPATH:-}"
 
 # --------------- Local fast workspace (avoid shared FS bottleneck) ---------------
 LOCAL_BASE="${SLURM_TMPDIR:-/tmp}"
-ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
-ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-1}"
-
-# If the script is launched as a normal (non-array) Slurm job, process all cycles
-# in this single task instead of only the first chunk.
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-  CYCLES_PER_TASK_EFFECTIVE=999999999
-  echo "ℹ️ Non-array submission detected: running as single full-range task."
-else
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+  IS_ARRAY_JOB=1
+  ARRAY_TASK_ID="${SLURM_ARRAY_TASK_ID}"
+  ARRAY_TASK_COUNT="${SLURM_ARRAY_TASK_COUNT:-1}"
   CYCLES_PER_TASK_EFFECTIVE="$CYCLES_PER_TASK"
+  echo "ℹ️ Array task detected: array_id=${ARRAY_TASK_ID}, array_count=${ARRAY_TASK_COUNT}"
+else
+  IS_ARRAY_JOB=0
+  ARRAY_TASK_ID=0
+  ARRAY_TASK_COUNT=1
+  CYCLES_PER_TASK_EFFECTIVE=0
+  echo "ℹ️ Direct Slurm submission detected: running all pending cycles in one task."
 fi
 
 RUN_DIR="${RUN_DIR:-$LOCAL_BASE/gfs_${SLURM_JOB_ID}_${ARRAY_TASK_ID}}"
@@ -198,7 +208,7 @@ cp -f "$TRACKS_CSV" "input/tracks.csv"
 
 # --------------- Build non-overlapping cycle subset for this array task ---------------
 mapfile -t CYCLES < <(
-  "${ENV_RUNNER[@]}" python3 - "$PROJECT_DIR" "input/tracks.csv" "$LEAD_DAYS" "$CYCLES_PER_TASK_EFFECTIVE" "$ARRAY_TASK_ID" "$ARRAY_TASK_COUNT" "$STORMS_FILTER" "$MERGE_OUTPUT_ROOT" "$PIPELINE_MODE" <<'PY'
+  "${ENV_RUNNER[@]}" python3 - "$PROJECT_DIR" "input/tracks.csv" "$LEAD_DAYS" "$CYCLES_PER_TASK_EFFECTIVE" "$ARRAY_TASK_ID" "$ARRAY_TASK_COUNT" "$STORMS_FILTER" "$MERGE_OUTPUT_ROOT" "$PIPELINE_MODE" "$IS_ARRAY_JOB" "$RESUME_COMPLETED_CYCLES" <<'PY'
 import os
 import sys
 import io
@@ -206,11 +216,13 @@ import contextlib
 from pathlib import Path
 from datetime import datetime
 
-project_dir, tracks_csv, lead_days, cycles_per_task, task_id, task_count, storms_filter, merge_root, pipeline_mode = sys.argv[1:]
+project_dir, tracks_csv, lead_days, cycles_per_task, task_id, task_count, storms_filter, merge_root, pipeline_mode, is_array_job, resume_completed_cycles = sys.argv[1:]
 lead_days = int(lead_days)
 cycles_per_task = int(cycles_per_task)
 task_id = int(task_id)
 task_count = int(task_count)
+is_array_job = int(is_array_job) == 1
+resume_completed_cycles = int(resume_completed_cycles) == 1
 
 sys.path.insert(0, os.path.join(project_dir, "src"))
 from assemble_and_run_grib import compute_needed_cycles
@@ -227,7 +239,7 @@ with contextlib.redirect_stdout(io.StringIO()):
     )
 all_tags = [dt.strftime("%Y%m%dT%H") for dt in cycle_dts]
 
-if pipeline_mode == "gee":
+if pipeline_mode == "gee" or not resume_completed_cycles:
     tags = all_tags
 else:
     done_stems = set()
@@ -248,29 +260,45 @@ else:
 if not tags:
     sys.exit(0)
 
-# deterministic chunking: contiguous chunks + array index
-chunk_size = cycles_per_task
-chunks = [tags[i:i + chunk_size] for i in range(0, len(tags), chunk_size)]
+if is_array_job:
+    if cycles_per_task <= 0:
+        raise SystemExit("❌ CYCLES_PER_TASK must be > 0 in array mode")
+    # deterministic chunking: contiguous chunks + array index
+    chunks = [tags[i:i + cycles_per_task] for i in range(0, len(tags), cycles_per_task)]
+    # if user submitted more array tasks than chunks, silently no-op extra tasks
+    if task_id >= len(chunks):
+        sys.exit(0)
+    selected = chunks[task_id]
+else:
+    selected = tags
 
-# if user submitted more array tasks than chunks, silently no-op extra tasks
-if task_id >= len(chunks):
-    sys.exit(0)
-
-for tag in chunks[task_id]:
+for tag in selected:
     print(tag)
 PY
 )
 
 if [[ ${#CYCLES[@]} -eq 0 ]]; then
-  echo "⏹️ No cycles assigned to this task (array_id=${ARRAY_TASK_ID}). Exit."
+  if [[ "$IS_ARRAY_JOB" == "1" ]]; then
+    echo "⏹️ No cycles assigned to this array task (array_id=${ARRAY_TASK_ID}). Exit."
+  else
+    echo "⏹️ No pending cycles to process. Exit."
+  fi
   exit 0
 fi
 
 echo "=== Job meta ==="
 echo "HOST=$(hostname)"
 echo "SLURM_JOB_ID=${SLURM_JOB_ID:-}"
-echo "SLURM_ARRAY_TASK_ID=${ARRAY_TASK_ID}"
-echo "SLURM_ARRAY_TASK_COUNT=${ARRAY_TASK_COUNT}"
+if [[ "$IS_ARRAY_JOB" == "1" ]]; then
+  echo "TASK_MODE=array"
+  echo "SLURM_ARRAY_TASK_ID=${ARRAY_TASK_ID}"
+  echo "SLURM_ARRAY_TASK_COUNT=${ARRAY_TASK_COUNT}"
+else
+  echo "TASK_MODE=single"
+  echo "SLURM_ARRAY_TASK_ID=N/A"
+  echo "SLURM_ARRAY_TASK_COUNT=N/A"
+fi
+echo "RESUME_COMPLETED_CYCLES=${RESUME_COMPLETED_CYCLES}"
 echo "RUN_DIR=$RUN_DIR"
 echo "PROJECT_DIR=$PROJECT_DIR"
 echo "PIPELINE_MODE=$PIPELINE_MODE"
